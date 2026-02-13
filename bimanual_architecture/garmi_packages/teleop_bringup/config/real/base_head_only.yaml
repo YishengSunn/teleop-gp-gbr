@@ -1,0 +1,19 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    garmi_base_controller:
+      type: garmi_controllers/MobileBaseController
+    garmi_head_controller:
+      type: garmi_controllers/HeadController
+
+garmi_base_controller:
+  ros__parameters:
+    sim: false
+    robot_id: garmi_base
+
+garmi_head_controller:
+  ros__parameters:
+    sim: false
+    robot_id: garmi_head

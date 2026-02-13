@@ -1,0 +1,361 @@
+# Combined controller configuration for GARMI (arms + base + head)
+# Namespace: /garmi
+
+garmi:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+      
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+      
+      multi_mode_controller:
+        type: multi_mode_controller/MultiModeController
+      
+      left_arm_state:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+      
+      left_arm_model:
+        type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+      
+      right_arm_state:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+      
+      right_arm_model:
+        type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+      
+      left_joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+      
+      right_joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+      
+      garmi_base_controller:
+        type: garmi_controllers/MobileBaseController
+      
+      garmi_head_controller:
+        type: garmi_controllers/HeadController
+      
+      moveit_arm_controller:
+        type: joint_trajectory_controller/JointTrajectoryController
+
+      right_move_to_start_controller:
+        type: teleop_controllers/MoveToStartExampleController
+
+      left_move_to_start_controller:
+        type: teleop_controllers/MoveToStartExampleController
+
+      left_joint_impedance_controller:
+        type: teleop_controllers/JointImpedanceController
+
+      right_joint_impedance_controller:
+        type: teleop_controllers/JointImpedanceController
+
+      left_cartesian_impedance_controller:
+        type: teleop_controllers/CartesianImpedanceController
+
+      right_cartesian_impedance_controller:
+        type: teleop_controllers/CartesianImpedanceController
+      
+      left_cartesian_delta_impedance_controller:
+        type: teleop_controllers/CartesianImpedanceDeltaController
+
+      right_cartesian_delta_impedance_controller:
+        type: teleop_controllers/CartesianImpedanceDeltaController
+
+/garmi/left_arm_state:
+  ros__parameters:
+    arm_id: left
+    frequency: 100
+
+/garmi/left_arm_model:
+  ros__parameters:
+    arm_id: left
+    frequency: 100
+
+/garmi/right_arm_state:
+  ros__parameters:
+    arm_id: right
+    frequency: 100
+
+/garmi/right_arm_model:
+  ros__parameters:
+    arm_id: right
+    frequency: 100
+
+/garmi/multi_mode_controller:
+  ros__parameters:
+    arm_count: 2
+    arm_1:
+      arm_id: left
+    arm_2:
+      arm_id: right
+    controllers: 
+      - panda_joint_impedance_controller
+      - panda_joint_velocity_controller
+      - comless_coupled_dual_cartesian_impedance_controller
+      - dual_cartesian_impedance_controller
+      - des_coupled_dual_cartesian_impedance_controller
+    resources:
+      comless_coupled_dual_cartesian_impedance_controller: ["left&right"]
+      dual_cartesian_impedance_controller: ["left&right"]
+      des_coupled_dual_cartesian_impedance_controller: ["left&right"]
+      panda_joint_impedance_controller: ["left", "right"]
+      panda_joint_velocity_controller: ["left", "right"]
+    start_controllers:
+      names: ["dual_cartesian_impedance_controller"]
+      resources:
+        dual_cartesian_impedance_controller: ["left&right"]
+
+/garmi/left_joint_impedance_example_controller:
+  ros__parameters:
+    arm_id: left
+    k_gains:
+      - 24.0
+      - 24.0
+      - 24.0
+      - 24.0
+      - 10.0
+      - 6.0
+      - 2.0
+    d_gains:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5
+
+/garmi/right_joint_impedance_example_controller:
+  ros__parameters:
+    arm_id: right
+    k_gains:
+      - 24.0
+      - 24.0
+      - 24.0
+      - 24.0
+      - 10.0
+      - 6.0
+      - 2.0
+    d_gains:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5
+
+/garmi_base/garmi_base_controller:
+  ros__parameters:
+    sim: false
+    robot_id: garmi_base
+    joints:
+      - garmi_base_joint_left
+      - garmi_base_joint_right
+      
+/garmi/garmi_head_controller:
+  ros__parameters:
+    sim: false
+    robot_id: garmi_head
+
+/garmi/moveit_arm_controller:
+  ros__parameters:
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - position
+      - velocity
+    joints:
+      - left_joint1
+      - left_joint2
+      - left_joint3
+      - left_joint4
+      - left_joint5
+      - left_joint6
+      - left_joint7
+      - right_joint1
+      - right_joint2
+      - right_joint3
+      - right_joint4
+      - right_joint5
+      - right_joint6
+      - right_joint7
+    gains:
+      left_joint1: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint2: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint3: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint4: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint5: { p: 250., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint6: { p: 150., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      left_joint7: { p: 50., d: 5., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint1: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint2: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint3: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint4: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint5: { p: 250., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint6: { p: 150., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+      right_joint7: { p: 50., d: 5., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+
+/garmi/right_move_to_start_controller:
+    ros__parameters:
+      arm_id: right
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration:
+        # [0.0, -0.8735, -0.789, -1.052, 0.362, 1.7477, -0.7918]
+        - 0.4639290072816009
+        - 0.08114102517020755
+        - -0.591896131794379
+        - -1.5411272161611922
+        - 0.12063684872571744
+        - 1.7365184662894042
+        - 0.4275991640591933
+
+
+/garmi/left_move_to_start_controller:
+    ros__parameters:
+      arm_id: left
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration:
+        # [0.0, -0.8735, 0.789, -1.052, 0.362, 1.7477, 0.7918]
+        - 0.08439254337909105
+        - -0.6992057373146772
+        - -0.2150431664434224
+        - -2.3056009519476635
+        - 0.22923184285294798
+        - 1.9080995428218364
+        - 0.306816530306646
+
+        
+/garmi/left_joint_impedance_controller:
+    ros__parameters:
+      command_arm_id: left
+      source_arm_id: left_fr3
+      joint_impedance_topic: /parti/left/franka_robot_state_broadcaster/measured_joint_states
+
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration: [0.1917, -1.0262, -0.9560, -1.6815, -0.3682, 2.8917, 0.6734]
+
+      
+        # - 0.08439254337909105
+        # - -0.6992057373146772
+        # - -0.2150431664434224
+        # - -2.3056009519476635
+        # - 0.22923184285294798
+        # - 1.9080995428218364
+        # - 0.306816530306646
+
+/garmi/right_joint_impedance_controller:
+    ros__parameters:
+      command_arm_id: right
+      source_arm_id: right_fr3
+      joint_impedance_topic: /parti/right/franka_robot_state_broadcaster/measured_joint_states
+
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration: [-0.1917, -1.0262, 0.9560, -1.6815, 0.3682, 2.8917, -0.6734]
+        # - 0.4639290072816009
+        # - 0.08114102517020755
+        # - -0.591896131794379
+        # - -1.5411272161611922
+        # - 0.12063684872571744
+        # - 1.7365184662894042
+        # - 0.4275991640591933
+
+
+/garmi/left_cartesian_impedance_controller:
+    ros__parameters:
+      # Robot this controller ACTUATES (effort command interfaces + robot_model)
+      arm_id: left
+
+      # Incoming desired pose topic (geometry_msgs/PoseStamped)
+      cartesian_pose_topic: /parti/left/franka_robot_state_broadcaster/current_pose
+      # Task-space stiffness (position / rotation)
+      pos_stiff: 1000.0
+      rot_stiff: 100.0
+
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration:
+        [0.0, -0.8735, 0.789, -1.052, -0.362, 1.7477, 0.0]
+      
+        # - 0.08439254337909105
+        # - -0.6992057373146772
+        # - -0.2150431664434224
+        # - -2.3056009519476635
+        # - 0.22923184285294798
+        # - 1.9080995428218364
+        # - 0.306816530306646
+
+/garmi/right_cartesian_impedance_controller:
+    ros__parameters:
+      # Robot this controller ACTUATES (effort command interfaces + robot_model)
+      arm_id: right
+
+      # Incoming desired pose topic (geometry_msgs/PoseStamped)
+      cartesian_pose_topic: /parti/right/franka_robot_state_broadcaster/current_pose
+
+      # Task-space stiffness (position / rotation)
+      pos_stiff: 1000.0
+      rot_stiff: 100.0
+
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration:
+        [0.0, -0.8735, -0.789, -1.052, 0.362, 1.7477, 0.0]
+        # - 0.4639290072816009
+        # - 0.08114102517020755
+        # - -0.591896131794379
+        # - -1.5411272161611922
+        # - 0.12063684872571744
+        # - 1.7365184662894042
+        # - 0.4275991640591933
+
+/garmi/left_cartesian_delta_impedance_controller:
+    ros__parameters:
+      arm_id: left
+      cartesian_delta_topic: /garmi/left/cartesian_delta
+
+      pos_stiff: 600.0
+      rot_stiff: 10.0
+      n_stiff: 10.0
+
+      delta_deadzone: 1e-6 
+      delta_max_step: 0.01
+
+      move_to_start: false
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration: [0.13677137, -1.31346579, -0.60512616, -1.5815221, -0.15270749, 2.8245522, 0.505629]
+
+
+      
+/garmi/right_cartesian_delta_impedance_controller:
+    ros__parameters:
+      arm_id: right
+      cartesian_delta_topic: /garmi/right/cartesian_delta
+
+      pos_stiff: 600.0
+      rot_stiff: 10.0
+      n_stiff: 10.0
+
+      delta_deadzone: 1e-6 
+      delta_max_step: 0.01
+
+
+      move_to_start: false
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration: [-0.13677137, -1.31346579, 0.60512616, -1.5815221, 0.15270749, 2.8245522, -0.505629]

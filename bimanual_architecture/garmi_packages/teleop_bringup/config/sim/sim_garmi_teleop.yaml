@@ -1,0 +1,242 @@
+garmi:
+  mujoco_server:
+    ros__parameters:
+      MujocoPlugins:
+        names:
+        - mujoco_ros2_control
+        mujoco_ros2_control:
+          type: mujoco_ros2_control::MujocoRos2ControlPlugin
+          hardware:
+            type: mujoco_ros_control/RobotHW
+            control_period: 0.001
+          
+            # params:
+            #   namespace: "garmi"
+            #   robot_description_node: "robot_state_publisher"
+            #   robot_description: "robot_description"
+
+          
+# garmi:
+  mujoco_ros2_control:
+    ros__parameters:
+      namespace: "garmi"
+      robot_description_node: "robot_state_publisher"
+      robot_description: "robot_description"
+      
+# test: # this should match the "namespace" value in "params" in line 17
+#   controller_manager:
+#       ros__parameters:
+#         update_rate: 10
+#         joint_state_broadcaster:
+#           type: joint_state_broadcaster/JointStateBroadcaster
+      
+# The indentation must reflect the namespace argument given under mujoco_ros2_control part above.
+# e.g. if there is a namespace,called foo, the root must be foo, followed by controller_manager and mujoco_server.
+# if there is no namespace, then the root would just be controller_manager.
+
+# garmi:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+      garmi_base_controller:
+        type: garmi_controllers/MobileBaseController
+      garmi_head_controller:
+        type: garmi_controllers/HeadController
+      sim_multi_mode_controller:
+        type: multi_mode_controller/MultiModeController
+      left_state_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+      left_model_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+          
+      right_state_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+      right_model_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+      left_joint_impedance_example_controller:
+          type: franka_example_controllers/JointImpedanceExampleController
+      right_joint_impedance_example_controller:
+          type: franka_example_controllers/JointImpedanceExampleController
+
+      moveit_arm_controller:
+        type: joint_trajectory_controller/JointTrajectoryController
+
+      left_move_to_start_controller:
+        type: teleop_controllers/MoveToStartExampleController
+      right_move_to_start_controller:
+        type: teleop_controllers/MoveToStartExampleController
+
+      left_joint_impedance_controller:
+        type: teleop_controllers/JointImpedanceController
+
+      right_joint_impedance_controller:
+        type: teleop_controllers/JointImpedanceController
+      
+  left_state_broadcaster:
+    ros__parameters:
+      arm_id: left
+      frequency: 100
+      robot_state_topic_name: /garmi/left_arm/franka_state
+
+  left_model_broadcaster:
+    ros__parameters:
+      arm_id: left
+      frequency: 100
+
+  right_state_broadcaster:
+    ros__parameters:
+      arm_id: right
+      frequency: 100
+      robot_state_topic_name: /garmi/right_arm/franka_state
+
+
+  right_model_broadcaster:
+    ros__parameters:
+      arm_id: right
+      frequency: 100
+
+  garmi_base_controller:
+    ros__parameters:
+      sim: true
+      robot_id: garmi_base
+
+  garmi_head_controller:
+    ros__parameters:
+      sim: true
+      robot_id: garmi_head
+    
+  sim_multi_mode_controller:
+    ros__parameters:
+      arm_count: 2
+      arm_1:
+        arm_id: left
+      arm_2:
+        arm_id: right
+      controllers: ["panda_joint_impedance_controller", 
+                    "panda_joint_velocity_controller",
+                    "comless_coupled_dual_cartesian_impedance_controller", 
+                    "dual_cartesian_impedance_controller",
+                    "des_coupled_dual_cartesian_impedance_controller"]
+      resources:
+          comless_coupled_dual_cartesian_impedance_controller: ["left&right"]
+          dual_cartesian_impedance_controller: ["left&right"]
+          des_coupled_dual_cartesian_impedance_controller: ["left&right"]
+          panda_joint_impedance_controller: ["left","right"]
+          panda_joint_velocity_controller: ["left","right"]
+      start_controllers:
+          names: ["dual_cartesian_impedance_controller"]
+          resources:
+              dual_cartesian_impedance_controller: ["left&right"]
+
+  left_joint_impedance_example_controller:
+    ros__parameters:
+      arm_id: left
+      k_gains:
+        - 24.0
+        - 24.0
+        - 24.0
+        - 24.0
+        - 10.0
+        - 6.0
+        - 2.0
+      d_gains:
+        - 2.0
+        - 2.0
+        - 2.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 0.5
+
+  right_joint_impedance_example_controller:
+    ros__parameters:
+      arm_id: right
+      k_gains:
+        - 24.0
+        - 24.0
+        - 24.0
+        - 24.0
+        - 10.0
+        - 6.0
+        - 2.0
+      d_gains:
+        - 2.0
+        - 2.0
+        - 2.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 0.5
+
+  left_move_to_start_controller:
+    ros__parameters:
+      arm_id: left
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+      start_joint_configuration:
+        [0.0, -0.7854, 0.0, -1.1780, 0.0, 1.5708, 0.7854]
+
+  right_move_to_start_controller:
+    ros__parameters:
+      arm_id: right
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+      start_joint_configuration:
+        [0.0, -0.7854, 0.0, -1.1780, 0.0, 1.5708, 0.7854]
+
+  left_joint_impedance_controller:
+    ros__parameters:
+      arm_id: left
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+      start_joint_configuration:
+        [0.0, -0.7854, 0.0, -1.1780, 0.0, 1.5708, 0.7854]
+
+  right_joint_impedance_controller:
+    ros__parameters:
+      arm_id: right
+      k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
+      d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
+      start_joint_configuration:
+        [0.0, -0.7854, 0.0, -1.1780, 0.0, 1.5708, 0.7854]
+  
+  moveit_arm_controller:
+    ros__parameters:
+      command_interfaces:
+        - effort
+      state_interfaces:
+        - position
+        - velocity
+      joints:
+        - right_joint1
+        - right_joint2
+        - right_joint3
+        - right_joint4
+        - right_joint5
+        - right_joint6
+        - right_joint7
+        - left_joint1
+        - left_joint2
+        - left_joint3
+        - left_joint4
+        - left_joint5
+        - left_joint6
+        - left_joint7
+      gains:
+        left_joint1: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint2: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint3: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint4: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint5: { p: 250., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint6: { p: 150., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        left_joint7: { p: 50., d: 5., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint1: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint2: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint3: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint4: { p: 600., d: 30., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint5: { p: 250., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint6: { p: 150., d: 10., i: 0., i_clamp: 1., ff_velocity_scale: 1. }
+        right_joint7: { p: 50., d: 5., i: 0., i_clamp: 1., ff_velocity_scale: 1. }

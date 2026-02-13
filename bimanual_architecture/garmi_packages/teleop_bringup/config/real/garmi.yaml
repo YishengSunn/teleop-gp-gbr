@@ -1,0 +1,115 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    garmi_base_controller:
+      type: garmi_controllers/MobileBaseController
+    garmi_head_controller:
+      type: garmi_controllers/HeadController
+    multi_mode_controller:
+      type: multi_mode_controller/MultiModeController
+    left_state_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+    left_model_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+    right_state_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+    right_model_broadcaster:
+      type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
+    left_joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+    right_joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+
+left_state_broadcaster:
+  ros__parameters:
+    arm_id: left
+    frequency: 100
+
+left_model_broadcaster:
+  ros__parameters:
+    arm_id: left
+    frequency: 100
+
+right_state_broadcaster:
+  ros__parameters:
+    arm_id: right
+    frequency: 100
+
+right_model_broadcaster:
+  ros__parameters:
+    arm_id: right
+    frequency: 100
+
+garmi_base_controller:
+  ros__parameters:
+    sim: true
+    robot_id: garmi_base
+
+garmi_head_controller:
+  ros__parameters:
+    sim: true
+    robot_id: garmi_head
+  
+multi_mode_controller:
+  ros__parameters:
+    arm_count: 2
+    arm_1:
+      arm_id: left
+    arm_2:
+      arm_id: right
+    controllers: ["panda_joint_impedance_controller", 
+                  "panda_joint_velocity_controller",
+                  "comless_coupled_dual_cartesian_impedance_controller", 
+                  "dual_cartesian_impedance_controller",
+                  "des_coupled_dual_cartesian_impedance_controller"]
+    resources:
+        comless_coupled_dual_cartesian_impedance_controller: ["left&right"]
+        dual_cartesian_impedance_controller: ["left&right"]
+        des_coupled_dual_cartesian_impedance_controller: ["left&right"]
+        panda_joint_impedance_controller: ["left","right"]
+        panda_joint_velocity_controller: ["left","right"]
+    start_controllers:
+        names: ["dual_cartesian_impedance_controller"]
+        resources:
+            dual_cartesian_impedance_controller: ["left&right"]
+
+left_joint_impedance_example_controller:
+  ros__parameters:
+    arm_id: left
+    k_gains:
+      - 24.0
+      - 24.0
+      - 24.0
+      - 24.0
+      - 10.0
+      - 6.0
+      - 2.0
+    d_gains:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5
+right_joint_impedance_example_controller:
+  ros__parameters:
+    arm_id: right
+    k_gains:
+      - 24.0
+      - 24.0
+      - 24.0
+      - 24.0
+      - 10.0
+      - 6.0
+      - 2.0
+    d_gains:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5

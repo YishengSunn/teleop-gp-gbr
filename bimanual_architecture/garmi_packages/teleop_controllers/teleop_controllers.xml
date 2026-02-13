@@ -1,0 +1,114 @@
+<library path="teleop_controllers">
+    <!-- Subscriber controllers - They provide a basic subscriber to move the robot to a desired pose. -->
+    <class name="teleop_controllers/JointImpedanceController"
+           type="teleop_controllers::JointImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The joint impedance controller subscribes to desired joint position.
+        </description>
+    </class>
+    <class name="teleop_controllers/CartesianImpedanceController"
+           type="teleop_controllers::CartesianImpedanceController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The cartesian impedance controller subscribes to desired pose of EE.
+        </description>
+    </class>
+    <class name="franka_controllers/CustomController"
+           type="franka_controllers::CustomController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Custom description.
+        </description>
+    </class>
+
+    <class name="teleop_controllers/HapticGravityCompensationController"
+           type="teleop_controllers::HapticGravityCompensationController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The haptic gravity compensation controller applies gravity compensation and gives haptic feedback based on the external forces acting on the robot.
+        </description>
+    </class>
+    <!-- Comless controllers - they simply generate a hard-coded motion centered around the robot's current state. -->
+    <class name="teleop_controllers/GravityCompensationExampleController"
+           type="teleop_controllers::GravityCompensationExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The gravity compensation controller only sends zero torques so that the robot does gravity compensation
+        </description>
+    </class>
+    <class name="teleop_controllers/JointImpedanceExampleController"
+           type="teleop_controllers::JointImpedanceExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The joint impedance example controller moves joint 4 and 5 in a very compliant periodic movement.
+        </description>
+    </class>
+    <class name="teleop_controllers/CartesianImpedanceExampleController"
+           type="teleop_controllers::CartesianImpedanceExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The cartesian impedance example controller moves the robot to a small offset from the current position.
+        </description>
+    </class>
+    <class name="teleop_controllers/MoveToStartExampleController"
+           type="teleop_controllers::MoveToStartExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The move to start example controller moves the robot into default pose.
+        </description>
+    </class>
+    <class name="teleop_controllers/JointPositionExampleController"
+           type="teleop_controllers::JointPositionExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Dummy position controller to starting pose.
+        </description>
+    </class>
+    <class name="teleop_controllers/JointVelocityExampleController"
+           type="teleop_controllers::JointVelocityExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Dummy velocity controller.
+        </description>
+    </class>
+    <class name="teleop_controllers/CartesianVelocityExampleController"
+           type="teleop_controllers::CartesianVelocityExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Dummy cartesian velocity controller.
+        </description>
+    </class>
+
+    <class name="teleop_controllers/MultiJointImpedanceExampleController"
+           type="teleop_controllers::MultiJointImpedanceExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Dummy multi joint impedance controller.
+        </description>
+    </class>
+    <class name="teleop_controllers/DualJointVelocityExampleController"
+           type="teleop_controllers::DualJointVelocityExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Dummy dual joint impedance controller.
+        </description>
+    </class>
+    <class name="teleop_controllers/ModelExampleController"
+           type="teleop_controllers::ModelExampleController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The franka model example controller evaluates and prints the dynamic model of Franka Robotics Robots.
+        </description>
+    </class>
+    <class name="teleop_controllers/CartesianImpedanceDeltaController"
+           type="teleop_controllers::CartesianImpedanceDeltaController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The cartesian impedance delta controller subscribes to desired pose offsets of EE.
+        </description>
+    </class>
+    <class name="teleop_controllers/GravityCompensationWithJointTorqueFeedbackController"
+           type="teleop_controllers::GravityCompensationWithJointTorqueFeedbackController" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The gravity compensation with joint torque feedback controller applies gravity compensation and adds the joint torque feedback to the commanded torques.
+        </description>
+    </class>
+    <class name="franka_ext_torque_broadcaster/FrankaExtTorqueBroadcaster"
+           type="franka_ext_torque_broadcaster::FrankaExtTorqueBroadcaster" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Publishes filtered external torques applied on Franka arms.
+        </description>
+    </class>
+    <class name="franka_torque_broadcaster/FrankaTorqueBroadcaster"
+           type="franka_torque_broadcaster::FrankaTorqueBroadcaster" base_class_type="controller_interface::ControllerInterface">
+        <description>
+            Publishes joint torques commanded to Franka arms.
+        </description>
+    </class>
+</library>

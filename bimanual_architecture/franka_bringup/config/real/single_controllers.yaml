@@ -1,0 +1,326 @@
+leader:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000  # Hz
+
+      gravity_compensation_example_controller:
+        type: franka_example_controllers/GravityCompensationExampleController
+
+      joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+      
+      cartesian_impedance_example_controller:
+        type: franka_example_controllers/CartesianImpedanceExampleController
+
+      joint_position_example_controller:
+        type: franka_example_controllers/JointPositionExampleController
+
+      joint_velocity_example_controller:
+        type: franka_example_controllers/JointVelocityExampleController
+      
+      cartesian_velocity_example_controller:
+        type: franka_example_controllers/CartesianVelocityExampleController
+
+      move_to_start_example_controller:
+        type: franka_example_controllers/MoveToStartExampleController
+
+      joint_trajectory_controller:
+        type: joint_effort_trajectory_controller/JointTrajectoryController
+
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+
+      franka_robot_state_broadcaster:
+        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+      model_example_controller:
+        type: franka_example_controllers/ModelExampleController
+      
+      gravity_compensation_with_joint_torque_feedback_controller:
+        type: parti_controllers/GravityCompensationWithJointTorqueFeedbackController
+      
+      haptic_gravity_compensation_controller:
+        type: franka_example_controllers/HapticGravityCompensationController
+
+  franka_robot_state_broadcaster:
+    ros__parameters:
+      arm_id: leader
+
+  model_example_controller:
+    ros__parameters:
+      arm_id: panda
+      
+  joint_trajectory_controller:
+    ros__parameters:
+      joints:
+        - panda_joint1
+        - panda_joint2
+        - panda_joint3
+        - panda_joint4
+        - panda_joint5
+        - panda_joint6
+        - panda_joint7
+      command_interfaces:
+        - effort
+      state_interfaces:
+        - position
+        - velocity
+      gains:
+        panda_joint1: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint2: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint3: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint4: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint5: { p: 250., d: 10., i: 0., i_clamp: 1. }
+        panda_joint6: { p: 150., d: 10., i: 0., i_clamp: 1. }
+        panda_joint7: { p: 50., d: 5., i: 0., i_clamp: 1. }
+
+  cartesian_impedance_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  joint_impedance_example_controller:
+    ros__parameters:
+      arm_id: panda
+      k_gains:
+        - 24.0
+        - 24.0
+        - 24.0
+        - 24.0
+        - 10.0
+        - 6.0
+        - 2.0
+      d_gains:
+        - 2.0
+        - 2.0
+        - 2.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 0.5
+  move_to_start_example_controller:
+    ros__parameters:
+      arm_id: panda
+      k_gains:
+        - 600.0
+        - 600.0
+        - 600.0
+        - 600.0
+        - 250.0
+        - 150.0
+        - 50.0
+      d_gains:
+        - 30.0
+        - 30.0
+        - 30.0
+        - 30.0
+        - 10.0
+        - 10.0
+        - 5.
+  joint_position_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  joint_velocity_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  cartesian_velocity_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  haptic_gravity_compensation_controller:
+    ros__parameters:
+      arm_id: panda
+      follower_input_mode: "joint_states"      # or "torque_topic"
+      follower_torque_topic: /haptic/follower_tau
+      joint_state_topic: /joint_states
+      lpf_alpha: 0.1
+      torque_clamp: [6.0, 6.0, 6.0, 6.0, 3.0, 3.0, 2.0]
+
+      # Impedance (used only in joint_states mode)
+      k_gains: [300.0, 300.0, 300.0, 250.0, 150.0, 100.0, 50.0]
+      d_gains: [10.0, 10.0, 10.0, 8.0, 6.0, 4.0, 3.0]
+
+      # Desired-q publisher to your existing follower controller
+      publish_desired_q: true
+      desired_q_topic: /joint_impedance/joints_desired
+
+
+  gravity_compensation_with_joint_torque_feedback_controller:
+    ros__parameters:
+      arm_id: leader
+      move_to_start: true
+      k_gains: [600.0 ,600.0 ,600.0 ,600.0 ,250.0 ,150.0 ,50.0]
+      d_gains: [30.0 ,30.0 ,30.0 ,30.0 ,10.0 ,10.0 ,5.0]
+      start_joint_configuration:
+        [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
+      
+      feedback_source: "commanded" # "measured" or "commanded"  
+      command_tau_topic: /follower/franka_robot_state_broadcaster/tau_j_d
+
+      # subtract the first valid sample so feedback starts at ~0
+      subtract_first_bias: true
+
+      # --- scaling / clamp (applied after bias subtraction) ---
+      feedback_scale: 0.5
+      feedback_max_abs_tau: 15.0
+
+      # If true, adds feedback on top of move-to-start torques during the motion.
+      # If false, feedback only applies after move-to-start finishes (or if move_to_start=false).
+      feedback_additive: false
+
+
+follower:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000  # Hz
+
+      gravity_compensation_example_controller:
+        type: franka_example_controllers/GravityCompensationExampleController
+
+      joint_impedance_example_controller:
+        type: franka_example_controllers/JointImpedanceExampleController
+      
+      cartesian_impedance_example_controller:
+        type: franka_example_controllers/CartesianImpedanceExampleController
+
+      joint_position_example_controller:
+        type: franka_example_controllers/JointPositionExampleController
+
+      joint_velocity_example_controller:
+        type: franka_example_controllers/JointVelocityExampleController
+      
+      cartesian_velocity_example_controller:
+        type: franka_example_controllers/CartesianVelocityExampleController
+
+      move_to_start_example_controller:
+        type: franka_example_controllers/MoveToStartExampleController
+
+      joint_trajectory_controller:
+        type: joint_effort_trajectory_controller/JointTrajectoryController
+
+      joint_state_broadcaster:
+        type: joint_state_broadcaster/JointStateBroadcaster
+
+      # franka_robot_state_broadcaster:
+      #   type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+
+      model_example_controller:
+        type: franka_example_controllers/ModelExampleController
+      
+      joint_impedance_controller:
+        type: teleop_controllers/JointImpedanceController
+      
+      cartesian_impedance_controller:
+        type: franka_example_controllers/CartesianImpedanceController
+      
+      franka_robot_state_broadcaster:
+        type: franka_torque_broadcaster/FrankaTorqueBroadcaster
+  
+  franka_robot_state_broadcaster:
+    ros__parameters:
+      arm_id: follower
+
+  model_example_controller:
+    ros__parameters:
+      arm_id: panda
+      
+  joint_trajectory_controller:
+    ros__parameters:
+      joints:
+        - panda_joint1
+        - panda_joint2
+        - panda_joint3
+        - panda_joint4
+        - panda_joint5
+        - panda_joint6  
+        - panda_joint7
+      command_interfaces:
+        - effort
+      state_interfaces:
+        - position
+        - velocity
+      gains:
+        panda_joint1: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint2: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint3: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint4: { p: 600., d: 30., i: 0., i_clamp: 1. }
+        panda_joint5: { p: 250., d: 10., i: 0., i_clamp: 1. }
+        panda_joint6: { p: 150., d: 10., i: 0., i_clamp: 1. }
+        panda_joint7: { p: 50., d: 5., i: 0., i_clamp: 1. }
+  
+
+  cartesian_impedance_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  joint_impedance_example_controller:
+    ros__parameters:
+      arm_id: panda
+      k_gains:
+        - 24.0
+        - 24.0
+        - 24.0
+        - 24.0
+        - 10.0
+        - 6.0
+        - 2.0
+      d_gains:
+        - 2.0
+        - 2.0
+        - 2.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 0.5
+  move_to_start_example_controller:
+    ros__parameters:
+      arm_id: panda
+      k_gains:
+        - 600.0
+        - 600.0
+        - 600.0
+        - 600.0
+        - 250.0
+        - 150.0
+        - 50.0
+      d_gains:
+        - 30.0
+        - 30.0
+        - 30.0
+        - 30.0
+        - 10.0
+        - 10.0
+        - 5.
+  joint_position_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  joint_velocity_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  cartesian_velocity_example_controller:
+    ros__parameters:
+      arm_id: panda
+
+  joint_impedance_controller:
+    ros__parameters:
+      command_arm_id: follower
+      source_arm_id: leader
+      joint_impedance_topic: /leader/joint_states
+
+      k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
+      start_joint_configuration:
+        [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
+
+  cartesian_impedance_controller:
+    ros__parameters:
+      arm_id: panda
+      pos_stiff: 500.0
+      rot_stiff: 20.0
