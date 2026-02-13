@@ -1,3 +1,5 @@
 [submodule "bimanual_architecture/mujoco_ros_pkgs"]
 	path = bimanual_architecture/mujoco_ros_pkgs
 	url = https://github.com/ubi-agni/mujoco_ros_pkgs.git
+[submodule "mujoco_ros_pkgs"]
+	url = https://github.com/tenfoldpaper/mujoco_ros_pkgs.git
