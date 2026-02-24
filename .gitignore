@@ -1,8 +1,21 @@
+# IDE and editor files
 .idea
 .vscode
+
+# Python files
 *.pyc
+
+# ROS and COLCON markers
 COLCON_IGNORE
 AMENT_IGNORE
+
+# Build directories
 cmake-build-*/
+
+# Project-specific generated content
 franka_multi_mode_controller/mm_demo_scripts/*
 parti_packages/
+
+# Data files
+/data/
+*.csv
