@@ -97,9 +97,10 @@ leader:
         - 1.0
         - 1.0
         - 0.5
+  
   move_to_start_example_controller:
     ros__parameters:
-      arm_id: panda
+      arm_id: leader
       k_gains:
         - 600.0
         - 600.0
@@ -116,6 +117,7 @@ leader:
         - 10.0
         - 10.0
         - 5.
+
   joint_position_example_controller:
     ros__parameters:
       arm_id: panda
@@ -131,7 +133,7 @@ leader:
   haptic_gravity_compensation_controller:
     ros__parameters:
       arm_id: panda
-      follower_input_mode: "joint_states"      # or "torque_topic"
+      follower_input_mode: "joint_states"  # or "torque_topic"
       follower_torque_topic: /haptic/follower_tau
       joint_state_topic: /joint_states
       lpf_alpha: 0.1
@@ -145,17 +147,16 @@ leader:
       publish_desired_q: true
       desired_q_topic: /joint_impedance/joints_desired
 
-
   gravity_compensation_with_joint_torque_feedback_controller:
     ros__parameters:
       arm_id: leader
       move_to_start: true
       k_gains: [600.0 ,600.0 ,600.0 ,600.0 ,250.0 ,150.0 ,50.0]
       d_gains: [30.0 ,30.0 ,30.0 ,30.0 ,10.0 ,10.0 ,5.0]
-      start_joint_configuration:
-        [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
+      # start_joint_configuration:
+      #   [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
       
-      feedback_source: "commanded" # "measured" or "commanded"  
+      feedback_source: "commanded"  # "measured" or "commanded"  
       command_tau_topic: /follower/franka_robot_state_broadcaster/tau_j_d
 
       # subtract the first valid sample so feedback starts at ~0
@@ -221,7 +222,6 @@ follower:
     ros__parameters:
       arm_id: follower
 
-
   model_example_controller:
     ros__parameters:
       arm_id: panda
@@ -249,7 +249,6 @@ follower:
         panda_joint5: { p: 250., d: 10., i: 0., i_clamp: 1. }
         panda_joint6: { p: 150., d: 10., i: 0., i_clamp: 1. }
         panda_joint7: { p: 50., d: 5., i: 0., i_clamp: 1. }
-  
 
   cartesian_impedance_example_controller:
     ros__parameters:
@@ -274,9 +273,10 @@ follower:
         - 1.0
         - 1.0
         - 0.5
+
   move_to_start_example_controller:
     ros__parameters:
-      arm_id: panda
+      arm_id: follower
       k_gains:
         - 600.0
         - 600.0
@@ -292,7 +292,8 @@ follower:
         - 30.0
         - 10.0
         - 10.0
-        - 5.
+        - 5.0
+
   joint_position_example_controller:
     ros__parameters:
       arm_id: panda
@@ -317,11 +318,12 @@ follower:
       move_to_start: true
       start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
       start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
-      start_joint_configuration:
-        [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
+      # start_joint_configuration:
+      #   [0.0564, -0.2057, -0.1670, -1.7927, -0.1318, 1.5700, 0.4203]
 
   cartesian_impedance_controller:
     ros__parameters:
-      arm_id: panda
-      pos_stiff: 500.0
+      arm_id: follower
+      # pos_stiff: 500.0
+      pos_stiff: 200.0
       rot_stiff: 20.0
