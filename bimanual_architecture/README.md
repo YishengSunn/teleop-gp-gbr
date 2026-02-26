@@ -23,11 +23,11 @@ More thorough information is available in the documentation.
 
 * Real robot:
     * FrankaState broadcaster
-    * All control interfaces (torque, position, velocity, Cartesian).
+    * All control interfaces (torque, position, velocity, Cartesian)
     * Example controllers for all interfaces
     * Controllers are swappable using rqt_controller_manager
     * Runtime franka::ControlException error recovery via `~/service_server/error_recovery`
-        * Upon recovery, the previously executed control loop will be executed again, so no reloading necessary.
+        * Upon recovery, the previously executed control loop will be executed again, so no reloading necessary
     * Runtime internal parameter setter services much like what is offered in the updated `franka_ros2`
 * Sim robot:
     * Same as the real robot, except Cartesian command interface is not available, and there is no plan to implement this for now.
