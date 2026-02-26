@@ -1,4 +1,4 @@
-# multipanda_ros2
+# Multipanda_ros2
 ## A sim- and real Panda robot integration based on the `ros2_control` framework
 <img src="docs/images/single_sim.png" alt="" height="250">
 <img src="docs/images/dual_sim.png" alt=""   height="250">
