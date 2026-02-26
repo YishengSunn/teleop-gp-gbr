@@ -19,3 +19,13 @@ parti_packages/
 # Data files
 /data/
 *.csv
+
+# Build artifacts
+build/
+
+# Installation directory
+install/
+
+# Log files
+log/
+*.log
