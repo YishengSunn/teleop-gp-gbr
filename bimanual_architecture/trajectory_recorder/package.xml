@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Records the end-effector Cartesian trajectory of a Franka robot using TF, 
   storing timestamped position and orientation data to a CSV file.</description>
-  <maintainer email="yisheng.sun@tum.de">user</maintainer>
+  <maintainer email="sunyisheng48@gmail.com">user</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

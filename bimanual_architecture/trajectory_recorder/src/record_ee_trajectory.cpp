@@ -11,8 +11,7 @@
 using namespace std::chrono_literals;
 
 
-std::string getTimeStamp()
-{
+std::string getTimeStamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
 
@@ -24,8 +23,7 @@ std::string getTimeStamp()
     return oss.str();
 }
 
-class EETrajectoryRecorder : public rclcpp::Node
-{
+class EETrajectoryRecorder : public rclcpp::Node {
 public:
   EETrajectoryRecorder()
   : Node("ee_trajectory_recorder"),
@@ -50,14 +48,12 @@ public:
     RCLCPP_INFO(this->get_logger(), "TF ready. Start recording.");
 
     timer_ = this->create_wall_timer(
-      50ms, std::bind(&EETrajectoryRecorder::record, this));
+      5ms, std::bind(&EETrajectoryRecorder::record, this));
   }
 
 private:
-  void record()
-  {
-    try
-    {
+  void record() {
+    try {
       auto tf = tf_buffer_.lookupTransform(
           base_frame_, ee_frame_, tf2::TimePointZero);
 
@@ -71,8 +67,7 @@ private:
             << q.x << "," << q.y << "," << q.z << "," << q.w
             << "\n";
     }
-    catch (tf2::TransformException &ex)
-    {
+    catch (tf2::TransformException &ex) {
       RCLCPP_WARN(this->get_logger(), "%s", ex.what());
     }
   }
@@ -84,8 +79,7 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<EETrajectoryRecorder>());
   rclcpp::shutdown();
