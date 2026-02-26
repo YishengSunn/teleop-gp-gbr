@@ -142,23 +142,68 @@ CallbackReturn CartesianImpedanceController::on_deactivate(
   return CallbackReturn::SUCCESS;
 }
 
-void CartesianImpedanceController::desiredCartesianCallback(
+void CartesianImpedanceController::desiredCartesianCallback (
   const std_msgs::msg::Float64MultiArray& msg) {
-  if (msg.data[0]){
-    for (auto i = 0; i < 3; ++i) {
-      desired_position[i] = msg.data[i];
-    }
-    if (msg.data[11]){ // for orientation matrix
-      Matrix3d desired_orientation_mat;
-      for (auto i = 0; i < 3; ++i) {
-        for (auto j = 0; j < 3; ++j) {
-          desired_orientation_mat(i, j) = msg.data[3+3*i+j];
-        }
-      }
-      desired_orientation = Eigen::Quaterniond(desired_orientation_mat);
+  const auto& d = msg.data;
+
+  // Case A: quaternion format [x,y,z,qx,qy,qz,qw]
+  if (d.size() == 7) {
+    for (int i = 0; i < 3; ++i) {
+      desired_position[i] = d[i];
     }
 
+    // Eigen quaternion ctor is (w, x, y, z)!
+    Eigen::Quaterniond q(d[6], d[3], d[4], d[5]);
+
+    // Guard against invalid quaternion
+    if (!std::isfinite(q.w()) || !std::isfinite(q.x()) ||
+        !std::isfinite(q.y()) || !std::isfinite(q.z()) ||
+        q.norm() < 1e-8) {
+      RCLCPP_WARN(get_node()->get_logger(), "Received invalid quaternion (size=7), ignoring orientation update.");
+      return;
+    }
+
+    q.normalize();
+    desired_orientation = q;
+    return;
   }
+
+  // Case B: rotation matrix format [x,y,z,R00..R22] (>=12)
+  if (d.size() >= 12) {
+    for (int i = 0; i < 3; ++i) {
+      desired_position[i] = d[i];
+    }
+
+    Eigen::Matrix3d R;
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        R(i, j) = d[3 + 3*i + j];
+      }
+    }
+
+    if (!R.allFinite()) {
+      RCLCPP_WARN(get_node()->get_logger(), "Received invalid rotation matrix (NaN/Inf), ignoring orientation update.");
+      return;
+    }
+
+    Eigen::Quaterniond q(R);
+    if (q.norm() < 1e-8) {
+      RCLCPP_WARN(get_node()->get_logger(), "Rotation matrix produced near-zero quaternion, ignoring orientation update.");
+      return;
+    }
+
+    q.normalize();
+    desired_orientation = q;
+    return;
+  }
+
+  // Otherwise: unsupported length
+  RCLCPP_WARN_THROTTLE(
+    get_node()->get_logger(),
+    *get_node()->get_clock(),
+    2000,
+    "pose_desired has unsupported length %zu. Use 7 ([x y z qx qy qz qw]) or >=12 ([x y z R00..R22]).",
+    d.size());
 }
 
 }  // namespace franka_example_controllers
