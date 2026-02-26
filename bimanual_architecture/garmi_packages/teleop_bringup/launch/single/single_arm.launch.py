@@ -33,6 +33,7 @@ def generate_launch_description():
     fake_sensor_commands_parameter_name = 'fake_sensor_commands'
     use_rviz_parameter_name = 'use_rviz'
     ns_parameter_name = 'ns'
+    move_to_start_parameter_name = 'move_to_start'
     control_mode_parameter_name = 'control_mode'
 
     robot_ip = LaunchConfiguration(robot_ip_parameter_name)
@@ -41,6 +42,7 @@ def generate_launch_description():
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
+    move_to_start = LaunchConfiguration(move_to_start_parameter_name)
     control_mode = LaunchConfiguration(control_mode_parameter_name)
 
     ns = LaunchConfiguration(ns_parameter_name)
@@ -92,6 +94,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             ns_parameter_name,
             description='Top-level namespace'),
+        DeclareLaunchArgument(
+            move_to_start_parameter_name,
+            default_value='false',
+            description='Enable movement'),
         DeclareLaunchArgument(
             control_mode_parameter_name,
             default_value='joint_impedance',
@@ -153,9 +159,17 @@ def generate_launch_description():
             output='screen',
             condition=IfCondition(
                 PythonExpression([
-                "'", ns, "' == 'leader'"
+                "'", ns, "' == 'leader' and '", move_to_start, "' == 'false'"
                 ]),
             )
+        ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=['move_to_start_example_controller', '--controller-manager', cm_abs],
+            namespace=ns,
+            output='screen',
+            condition=IfCondition(move_to_start),
         ),
         Node(
             package='controller_manager',
@@ -165,7 +179,7 @@ def generate_launch_description():
             output='screen',
             condition=IfCondition(
                 PythonExpression([
-                "'", ns, "' == 'follower' and '", control_mode, "' == 'joint_impedance'"
+                "'", ns, "' == 'follower' and '", move_to_start, "' == 'false' and '", control_mode, "' == 'joint_impedance'"
                 ]),
             ),
         ),
@@ -177,7 +191,7 @@ def generate_launch_description():
             output='screen',
             condition=IfCondition(
                 PythonExpression([
-                "'", ns, "' == 'follower' and '", control_mode, "' == 'cartesian_impedance'"
+                "'", ns, "' == 'follower' and '", move_to_start, "' == 'false' and '", control_mode, "' == 'cartesian_impedance'"
                 ]),
             ),
         ),
