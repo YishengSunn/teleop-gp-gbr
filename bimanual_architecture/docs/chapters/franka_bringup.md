@@ -1,7 +1,7 @@
 # franka_bringup
 This package serves as the repository for the launch files that you wlil use to start up the framework.
 Broadly speaking, there are currently 2 versions of the launch file that you can use:
-- the single-arm `franka.launch.py` and its simulation version, `franka_sim.launch.py`
+- the single-arm `franka.launch.py` and its simulation version, `franka_sim.launch.py`.
 - the two-arm `dual_franka.launch.py` and its simulation version, `dual_franka_sim.launch.py`.
 The launch files are where you define the various configurations for starting up the robot. Several parameters are defined as launch arguments, while others are hard-coded.
 
