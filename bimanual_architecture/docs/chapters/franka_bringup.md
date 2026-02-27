@@ -15,18 +15,18 @@ The argument for the real robot launch files (i.e. the ones without `sim`) are:
 - Fake hardware utilization, `use_fake_hardware` and `fake_sensor_commands` -- although these are just legacy arguments from the original `franka_ros2` repository; you would now simply use the simulation if you do not have access to a real robot.
 
 Hard-coded values for the real robot launch files are:
-- the URDF path, 
+- the URDF path.
 - `ros2_control`'s `yaml` configuration file.
 
 ### Sim robot launch files
 The argument for the MuJoCo simulated robot launch files (i.e. `sim`s) are:
 - the robot's name `arm_id` -- this is fixed to `panda` for the single-arm version.
-- its gripper configuration `hand`,
-- RVIZ visualization toggle, `use_rviz`,
+- its gripper configuration `hand`.
+- RVIZ visualization toggle, `use_rviz`.
 
 Hard-coded values for the sim robot launch files are:
-- the URDF path, typically stored in `franka_description`,
-- `mujoco_ros_pkg`'s `yaml` configuration file along with `ros2_control`-specific parameters,
+- the URDF path, typically stored in `franka_description`.
+- `mujoco_ros_pkg`'s `yaml` configuration file along with `ros2_control`-specific parameters.
 - the `default_scene_xml_file`, which specifies the path to the MuJoCo environment, also stored in `franka_description`. 
 
 For the single-arm version (`franka_sim.launch.py`), the default `scene.xml` will be loaded when no arguments are given, and the `dual_scene.xml` for the dual-arm version.
