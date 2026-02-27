@@ -9,8 +9,8 @@ The launch files are where you define the various configurations for starting up
 ### Real robot launch files
 The argument for the real robot launch files (i.e. the ones without `sim`) are:
 - the robot's name `arm_id` -- this is fixed to `panda` for the single-arm version.
-- the robot's IP address `robot_ip`, 
-- its gripper configuration `hand`,
+- the robot's IP address `robot_ip`.
+- its gripper configuration `hand`.
 - RVIZ visualization toggle, `use_rviz`. 
 - Fake hardware utilization, `use_fake_hardware` and `fake_sensor_commands` -- although these are just legacy arguments from the original `franka_ros2` repository; you would now simply use the simulation if you do not have access to a real robot.
 
