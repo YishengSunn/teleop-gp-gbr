@@ -310,12 +310,12 @@ HapticGravityCompensationController::update(
         const Vector7d q_err  = q_  - q_follower_;
         const Vector7d dq_err = dq_ - dq_follower_;
         tau_imp = k_gains_.cwiseProduct(q_err) + d_gains_.cwiseProduct(dq_err);
-        printf("q_err: %.4f %.4f %.4f %.4f %.4f %.4f %.4f | "
-               "dq_err: %.4f %.4f %.4f %.4f %.4f %.4f %.4f | "
-               "tau_imp: %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-               q_err(0), q_err(1), q_err(2), q_err(3), q_err(4), q_err(5), q_err(6),
-               dq_err(0), dq_err(1), dq_err(2), dq_err(3), dq_err(4), dq_err(5), dq_err(6),
-               tau_imp(0), tau_imp(1), tau_imp(2), tau_imp(3), tau_imp(4), tau_imp(5), tau_imp(6));
+        // printf("q_err: %.4f %.4f %.4f %.4f %.4f %.4f %.4f | "
+        //        "dq_err: %.4f %.4f %.4f %.4f %.4f %.4f %.4f | "
+        //        "tau_imp: %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+        //        q_err(0), q_err(1), q_err(2), q_err(3), q_err(4), q_err(5), q_err(6),
+        //        dq_err(0), dq_err(1), dq_err(2), dq_err(3), dq_err(4), dq_err(5), dq_err(6),
+        //        tau_imp(0), tau_imp(1), tau_imp(2), tau_imp(3), tau_imp(4), tau_imp(5), tau_imp(6));
         tau_raw_ = tau_imp;
         if (!have_first_msg_) {
           tau_filtered_ = tau_raw_;
@@ -335,9 +335,9 @@ HapticGravityCompensationController::update(
       tau_cmd_(i) = 0.5 * clamp(tau_filtered_(i), -lim, +lim);
     }
   }
-  printf("tau_cmd: %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-         tau_cmd_(0), tau_cmd_(1), tau_cmd_(2), tau_cmd_(3),
-         tau_cmd_(4), tau_cmd_(5), tau_cmd_(6));
+  // printf("tau_cmd: %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
+  //        tau_cmd_(0), tau_cmd_(1), tau_cmd_(2), tau_cmd_(3),
+  //        tau_cmd_(4), tau_cmd_(5), tau_cmd_(6));
 
   // 4) Send effort commands (overlay on pure GC baseline == 0)
   // for (int i = 0; i < num_joints; ++i) {
