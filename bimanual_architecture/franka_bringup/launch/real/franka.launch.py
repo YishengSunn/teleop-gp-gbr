@@ -27,6 +27,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     robot_ip_parameter_name = 'robot_ip'
+    arm_id_parameter_name = 'arm_id'
     load_gripper_parameter_name = 'load_gripper'
     use_fake_hardware_parameter_name = 'use_fake_hardware'
     fake_sensor_commands_parameter_name = 'fake_sensor_commands'
@@ -36,6 +37,7 @@ def generate_launch_description():
     control_mode_parameter_name = 'control_mode'
 
     robot_ip = LaunchConfiguration(robot_ip_parameter_name)
+    arm_id = LaunchConfiguration(arm_id_parameter_name)
     load_gripper = LaunchConfiguration(load_gripper_parameter_name)
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
@@ -51,7 +53,7 @@ def generate_launch_description():
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, ' hand:=', load_gripper,
          ' robot_ip:=', robot_ip, ' use_fake_hardware:=', use_fake_hardware,
-         ' fake_sensor_commands:=', fake_sensor_commands])
+         ' fake_sensor_commands:=', fake_sensor_commands, ' arm_id:=', arm_id])
 
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_franka.rviz')
@@ -65,6 +67,9 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            arm_id_parameter_name,
+            description='Arm ID of the robot.'),
         DeclareLaunchArgument(
             robot_ip_parameter_name,
             description='Hostname or IP address of the robot.'),
@@ -135,7 +140,7 @@ def generate_launch_description():
             package='controller_manager',
             executable='spawner',
             arguments=['joint_state_broadcaster', '--controller-manager', cm_abs],
-            namespace='leader',
+            namespace=ns,
             output='screen',
         ),
         Node(
@@ -149,7 +154,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['haptic_gravity_compensation_controller', '--controller-manager', cm_abs],
+            arguments=['gravity_compensation_with_joint_torque_feedback_controller', '--controller-manager', cm_abs],
             namespace=ns,
             output='screen',
             condition=IfCondition(
@@ -178,7 +183,6 @@ def generate_launch_description():
                 ]),
             ),
         ),
-
         Node(
             package='controller_manager',
             executable='spawner',
@@ -197,14 +201,11 @@ def generate_launch_description():
             launch_arguments={robot_ip_parameter_name: robot_ip,
                               use_fake_hardware_parameter_name: use_fake_hardware}.items(),
             condition=IfCondition(load_gripper)
-
         ),
-
         Node(package='rviz2',
              executable='rviz2',
              name='rviz2',
              arguments=['--display-config', rviz_file],
              condition=IfCondition(use_rviz)
              )
-
     ])
