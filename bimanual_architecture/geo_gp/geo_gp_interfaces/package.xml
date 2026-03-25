@@ -4,7 +4,7 @@
   <name>geo_gp_interfaces</name>
   <version>0.0.1</version>
   <description>Interfaces for Geo-GP trajectory prediction system</description>
-  <maintainer email="sunyisheng48@gmail.com">user</maintainer>
+  <maintainer email="sunyisheng48@gmail.com">Yisheng Sun</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
