@@ -1,0 +1,12 @@
+# Goal
+geometry_msgs/Pose[] poses
+float64[] time_from_start
+
+---
+# Result
+bool success
+
+---
+# Feedback
+int32 current_index
+float64 tracking_error
