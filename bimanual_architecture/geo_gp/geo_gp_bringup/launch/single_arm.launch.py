@@ -152,6 +152,18 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
+            arguments=['franka_torque_broadcaster', '--controller-manager', cm_abs],
+            namespace=ns,
+            output='screen',
+            condition=IfCondition(
+                PythonExpression([
+                    "'", ns, "' == 'follower' and '", use_fake_hardware, "' == 'false'"
+                ]),
+            ),
+        ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
             arguments=['gravity_compensation_with_joint_torque_feedback_controller', '--controller-manager', cm_abs],
             namespace=ns,
             output='screen',

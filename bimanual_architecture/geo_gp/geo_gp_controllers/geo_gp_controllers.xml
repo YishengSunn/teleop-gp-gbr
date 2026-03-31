@@ -15,6 +15,14 @@
     </description>
   </class>
 
+  <class name="geo_gp_controllers/FrankaTorqueBroadcaster"
+         type="geo_gp_controllers::FrankaTorqueBroadcaster"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Franka torque broadcaster.
+    </description>
+  </class>
+
   <class name="geo_gp_controllers/GravityCompensationWithJointTorqueFeedbackController"
          type="geo_gp_controllers::GravityCompensationWithJointTorqueFeedbackController"
          base_class_type="controller_interface::ControllerInterface">
