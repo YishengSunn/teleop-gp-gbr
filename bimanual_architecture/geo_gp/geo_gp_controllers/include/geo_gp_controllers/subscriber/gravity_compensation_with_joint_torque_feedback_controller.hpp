@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -9,6 +11,7 @@
 #include <controller_interface/controller_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
 
@@ -42,7 +45,7 @@ class GravityCompensationWithJointTorqueFeedbackController
   enum class Mode { MOVE_TO_START, FEEDBACK_GRAVITY };
   Mode mode_{Mode::MOVE_TO_START};
 
-  // --- robot state (from state interfaces)
+  // Robot state (from state interfaces)
   static constexpr int kNumJoints = 7;
   std::string arm_id_{"fr3"};
   Vector7d q_{Vector7d::Zero()};
@@ -54,31 +57,48 @@ class GravityCompensationWithJointTorqueFeedbackController
   rclcpp::Time start_time_;
   std::unique_ptr<MotionGenerator> motion_generator_;
 
-  // --- behavior params
+  // Behavior params
   bool move_to_start_{true};
 
-  // --- enable/disable feedback
+  // Enable/disable feedback
   bool enable_feedback_{true};
 
-  // --- single torque feedback topic (Float64MultiArray size 7)
-  std::string torque_feedback_topic_{"/filtered_external_tau"};
+  // Feedback source selection:
+  // - commanded: use commanded torque topic (tau_j_d)
+  // - measured: use measured/estimated external torque topic (tau_ext_hat_filtered)
+  std::string feedback_source_{"measured"};
+
+  // Single torque feedback topic (Float64MultiArray size 7).
+  // If non-empty, this overrides feedback_source_ auto-selection.
+  std::string torque_feedback_topic_{""};
 
   // Bias removal
   bool subtract_first_bias_{true};
   bool bias_initialized_{false};
   Vector7d tau_bias_{Vector7d::Zero()};
 
-  // --- scaling / safety clamp
+  // Scaling / safety clamp
   double feedback_scale_{1.0};
   double feedback_max_abs_tau_{30.0};
   bool feedback_additive_{false};
 
-  // realtime transport of tau feedback
+  // While trajectory_executor reports running=true on execution_running_topic, scale
+  // feedback by execution_feedback_scale (0 = off). Ends immediately when running=false.
+  bool suppress_feedback_during_execution_{true};
+  std::string execution_running_topic_{"/execution/running"};
+  double execution_feedback_scale_{0.0};
+
+  std::atomic<bool> execution_running_{false};
+
+  // Realtime transport of tau feedback
   realtime_tools::RealtimeBuffer<Vector7d> tau_feedback_rt_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr tau_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr execution_running_sub_;
 
   void updateJointStates();
   void onTauArray(const std_msgs::msg::Float64MultiArray& msg);
+  void onExecutionRunning(const std_msgs::msg::Bool& msg);
+  [[nodiscard]] double effectiveFeedbackScale() const;
 };
 
 }  // namespace geo_gp_controllers

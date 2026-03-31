@@ -14,7 +14,7 @@ inline bool isFinite(double x) { return std::isfinite(x); }
 
 inline double clampAbs(double x, double max_abs) {
   if (!isFinite(x)) return 0.0;
-  if (x >  max_abs) return  max_abs;
+  if (x > max_abs) return max_abs;
   if (x < -max_abs) return -max_abs;
   return x;
 }
@@ -54,11 +54,17 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_init() {
       "start_joint_configuration",
       {0.0, -M_PI_4, 0.0, -3.0 * M_PI_4, 0.0, M_PI_2, M_PI_4});
 
-    // master enable for torque feedback
+    // Master enable for torque feedback
     auto_declare<bool>("enable_feedback", true);
 
-    // single feedback topic (can be tau_ext_hat_filtered OR tau_j_d etc.)
-    auto_declare<std::string>("torque_feedback_topic", "/filtered_external_tau");
+    // Source selection:
+    // - "commanded": subscribe to tau_j_d
+    // - "measured": subscribe to tau_ext_hat_filtered
+    auto_declare<std::string>("feedback_source", "measured");
+
+    // Optional manual override. If non-empty, this topic is used directly
+    // regardless of feedback_source.
+    auto_declare<std::string>("torque_feedback_topic", "");
 
     // Bias removal
     auto_declare<bool>("subtract_first_bias", true);
@@ -70,7 +76,13 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_init() {
     // If true, add feedback on top during move-to-start
     auto_declare<bool>("feedback_additive", false);
 
-  } catch (const std::exception& e) {
+    // trajectory_executor publishes Bool on execution_running_topic (true while executing).
+    auto_declare<bool>("suppress_feedback_during_execution", true);
+    auto_declare<std::string>("execution_running_topic", "/execution/running");
+    auto_declare<double>("execution_feedback_scale", 0.0);
+  }
+  
+  catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
   }
@@ -84,13 +96,38 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
   move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
 
   enable_feedback_ = get_node()->get_parameter("enable_feedback").as_bool();
+  feedback_source_ = get_node()->get_parameter("feedback_source").as_string();
   torque_feedback_topic_ = get_node()->get_parameter("torque_feedback_topic").as_string();
+
+  // Resolve topic from feedback_source when no explicit override is provided.
+  if (torque_feedback_topic_.empty()) {
+    if (feedback_source_ == "commanded") {
+      torque_feedback_topic_ = "/follower/franka_torque_broadcaster/tau_j_d";
+    }
+    
+    else if (feedback_source_ == "measured") {
+      torque_feedback_topic_ = "/follower/franka_torque_broadcaster/tau_ext_hat_filtered";
+    }
+    
+    else {
+      RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Invalid feedback_source='%s'. Supported values: commanded, measured",
+        feedback_source_.c_str());
+      return CallbackReturn::FAILURE;
+    }
+  }
 
   subtract_first_bias_ = get_node()->get_parameter("subtract_first_bias").as_bool();
 
   feedback_scale_ = get_node()->get_parameter("feedback_scale").as_double();
   feedback_max_abs_tau_ = get_node()->get_parameter("feedback_max_abs_tau").as_double();
   feedback_additive_ = get_node()->get_parameter("feedback_additive").as_bool();
+
+  suppress_feedback_during_execution_ =
+    get_node()->get_parameter("suppress_feedback_during_execution").as_bool();
+  execution_running_topic_ = get_node()->get_parameter("execution_running_topic").as_string();
+  execution_feedback_scale_ = get_node()->get_parameter("execution_feedback_scale").as_double();
 
   // Move-to-start goal
   auto start_joint_configuration_vector =
@@ -121,7 +158,7 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
 
   dq_filtered_.setZero();
 
-  // reset bias each configure (and set NaNs in buffer)
+  // Reset bias each configure (and set NaNs in buffer)
   bias_initialized_ = false;
   tau_bias_.setZero();
 
@@ -129,19 +166,40 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
   init_tau.setConstant(std::numeric_limits<double>::quiet_NaN());
   tau_feedback_rt_.writeFromNonRT(init_tau);
 
-  // (Re)subscribe only if feedback enabled
+  // (Re)subscribe only if feedback is enabled
   tau_sub_.reset();
+  execution_running_sub_.reset();
+  execution_running_.store(false, std::memory_order_release);
+
   if (enable_feedback_) {
     tau_sub_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
       torque_feedback_topic_,
       rclcpp::SystemDefaultsQoS(),
       [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { onTauArray(*msg); });
 
+    if (suppress_feedback_during_execution_) {
+      execution_running_sub_ =
+        get_node()->create_subscription<std_msgs::msg::Bool>(
+          execution_running_topic_,
+          rclcpp::QoS(1).transient_local(),
+          [this](const std_msgs::msg::Bool::SharedPtr msg) { onExecutionRunning(*msg); });
+    }
+
     RCLCPP_INFO(get_node()->get_logger(),
-                "Torque feedback ENABLED, subscribing to '%s', subtract_first_bias=%s",
+                "Torque feedback ENABLED (source=%s), subscribing to '%s', subtract_first_bias=%s",
+                feedback_source_.c_str(),
                 torque_feedback_topic_.c_str(),
                 subtract_first_bias_ ? "true" : "false");
-  } else {
+
+    if (suppress_feedback_during_execution_) {
+      RCLCPP_INFO(
+        get_node()->get_logger(),
+        "Execution-aware feedback: running_topic=%s scale_while_executing=%.4f",
+        execution_running_topic_.c_str(),
+        execution_feedback_scale_);
+    }
+  } 
+  else {
     RCLCPP_INFO(get_node()->get_logger(), "Torque feedback DISABLED (enable_feedback=false)");
   }
 
@@ -178,13 +236,14 @@ controller_interface::return_type GravityCompensationWithJointTorqueFeedbackCont
 
   // Read latest feedback torques (RT-safe)
   const Vector7d tau_fb = *(tau_feedback_rt_.readFromRT());
+  const double eff_scale = effectiveFeedbackScale();
 
   auto write_feedback_or_zero = [&]() {
     for (int i = 0; i < kNumJoints; ++i) {
-      double t = tau_fb(i);
-      if (!isFinite(t)) t = 0.0;
-      t = feedback_scale_ * clampAbs(t, feedback_max_abs_tau_);
-      command_interfaces_[i].set_value(t);
+      double tau_fb_i = tau_fb(i);
+      if (!isFinite(tau_fb_i)) tau_fb_i = 0.0;
+      tau_fb_i = eff_scale * clampAbs(tau_fb_i, feedback_max_abs_tau_);
+      command_interfaces_[i].set_value(tau_fb_i);
     }
   };
 
@@ -203,20 +262,24 @@ controller_interface::return_type GravityCompensationWithJointTorqueFeedbackCont
 
       if (feedback_additive_) {
         for (int i = 0; i < kNumJoints; ++i) {
-          double t = tau_fb(i);
-          if (!isFinite(t)) t = 0.0;
-          t = feedback_scale_ * clampAbs(t, feedback_max_abs_tau_);
-          command_interfaces_[i].set_value(tau_move(i) + t);
+          double tau_fb_i = tau_fb(i);
+          if (!isFinite(tau_fb_i)) tau_fb_i = 0.0;
+          tau_fb_i = eff_scale * clampAbs(tau_fb_i, feedback_max_abs_tau_);
+          command_interfaces_[i].set_value(tau_move(i) + tau_fb_i);
         }
-      } else {
+      }
+
+      else {
         for (int i = 0; i < kNumJoints; ++i) {
           command_interfaces_[i].set_value(tau_move(i));
         }
       }
-    } else {
+    }
+    
+    else {
       mode_ = Mode::FEEDBACK_GRAVITY;
 
-      // reset bias when switching modes too
+      // Reset bias when switching modes too
       bias_initialized_ = false;
       tau_bias_.setZero();
 
@@ -268,9 +331,14 @@ void GravityCompensationWithJointTorqueFeedbackController::onTauArray(
   // Initialize bias from first *fully finite* sample
   if (subtract_first_bias_ && !bias_initialized_) {
     bool ok = true;
+
     for (int i = 0; i < kNumJoints; ++i) {
-      if (!std::isfinite(tau_in(i))) { ok = false; break; }
+      if (!std::isfinite(tau_in(i))) {
+        ok = false;
+        break;
+      }
     }
+
     if (ok) {
       tau_bias_ = tau_in;
       bias_initialized_ = true;
@@ -280,10 +348,26 @@ void GravityCompensationWithJointTorqueFeedbackController::onTauArray(
   Vector7d tau;
   if (subtract_first_bias_ && bias_initialized_) {
     tau = -(tau_in - tau_bias_);
-  } else {
+  }
+  else {
     tau = -tau_in;
   }
   tau_feedback_rt_.writeFromNonRT(tau);
+}
+
+void GravityCompensationWithJointTorqueFeedbackController::onExecutionRunning(
+  const std_msgs::msg::Bool& msg) {
+  execution_running_.store(msg.data, std::memory_order_release);
+}
+
+double GravityCompensationWithJointTorqueFeedbackController::effectiveFeedbackScale() const {
+  if (!suppress_feedback_during_execution_) {
+    return feedback_scale_;
+  }
+  if (!execution_running_.load(std::memory_order_acquire)) {
+    return feedback_scale_;
+  }
+  return feedback_scale_ * execution_feedback_scale_;
 }
 
 }  // namespace geo_gp_controllers
