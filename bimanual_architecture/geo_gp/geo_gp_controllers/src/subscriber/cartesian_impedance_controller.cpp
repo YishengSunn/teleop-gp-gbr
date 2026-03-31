@@ -5,6 +5,7 @@
 #include <exception>
 #include <string>
 #include <chrono>
+#include <algorithm>
 
 #include <franka/model.h>
 
@@ -111,8 +112,87 @@ CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
     skip_pose_read_this_cycle = true;
   }
 
+  // Prediction ended: optional linear blend in pose space to cached leader EE (duration from distance).
+  if (pending_blend_to_leader_.load(std::memory_order_acquire)) {
+    if (!blend_to_leader_enabled_) {
+      pending_blend_to_leader_.store(false, std::memory_order_release);
+    }
+    else {
+      const auto* goal = leader_pose_cache_.readFromRT();
+      if (goal) {
+        pending_blend_to_leader_.store(false, std::memory_order_release);
+
+        blend_pose_start_.px = current_position.x();
+        blend_pose_start_.py = current_position.y();
+        blend_pose_start_.pz = current_position.z();
+        current_orientation.normalize();
+        desiredPoseFromQuaternion(current_orientation, &blend_pose_start_);
+
+        blend_pose_goal_ = *goal;
+
+        const Vector3d p0(blend_pose_start_.px, blend_pose_start_.py, blend_pose_start_.pz);
+        const Vector3d p1(blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
+        const double pos_dist = (p1 - p0).norm();
+        const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
+        const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        const double ang_dist = q0.angularDistance(q1);
+
+        blend_duration_sec_ =
+          blend_seconds_per_meter_ * pos_dist + blend_seconds_per_rad_ * ang_dist;
+        blend_duration_sec_ =
+          std::clamp(blend_duration_sec_, blend_duration_min_, blend_duration_max_);
+
+        blend_t0_ = this->get_node()->now();
+        blending_to_leader_.store(true, std::memory_order_release);
+        mode_.store(static_cast<uint8_t>(Mode::BLEND_TO_LEADER), std::memory_order_release);
+        skip_pose_read_this_cycle = true;
+      }
+      else {
+        static int log_ctr = 0;
+        if (++log_ctr % 500 == 0) {
+          RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Blend-to-leader waiting for leader pose cache (will retry)...");
+        }
+      }
+    }
+  }
+
+  if (static_cast<Mode>(mode_.load(std::memory_order_relaxed)) == Mode::BLEND_TO_LEADER) {
+    const double elapsed = (this->get_node()->now() - blend_t0_).seconds();
+    const double s =
+      (blend_duration_sec_ > 1e-6) ? std::min(1.0, elapsed / blend_duration_sec_) : 1.0;
+
+    const Vector3d p0(blend_pose_start_.px, blend_pose_start_.py, blend_pose_start_.pz);
+    const Vector3d p1(blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
+    const Vector3d p = (1.0 - s) * p0 + s * p1;
+
+    const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
+    const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+    const Quaterniond q_interp = q0.slerp(s, q1);
+
+    desired_pose_rt_.px = p.x();
+    desired_pose_rt_.py = p.y();
+    desired_pose_rt_.pz = p.z();
+    desiredPoseFromQuaternion(q_interp, &desired_pose_rt_);
+
+    if (s >= 1.0 - 1e-6) {
+      desired_pose_rt_ = blend_pose_goal_;
+      desired_pose_buffer_.writeFromNonRT(blend_pose_goal_);
+      desired_pose_seq_.fetch_add(1, std::memory_order_release);
+      last_desired_pose_seq_ = desired_pose_seq_.load(std::memory_order_acquire);
+      blending_to_leader_.store(false, std::memory_order_release);
+      blend_running_hold_until_ =
+        this->get_node()->now() + rclcpp::Duration::from_seconds(blend_running_hold_sec_);
+      mode_.store(static_cast<uint8_t>(Mode::CARTESIAN), std::memory_order_release);
+    }
+
+    skip_pose_read_this_cycle = true;
+  }
+
   // Cartesian mode: only apply desired pose if a new message arrived.
-  if (!skip_pose_read_this_cycle) {
+  if (!skip_pose_read_this_cycle &&
+      static_cast<Mode>(mode_.load(std::memory_order_relaxed)) != Mode::BLEND_TO_LEADER) {
     const uint64_t seq = desired_pose_seq_.load(std::memory_order_acquire);
     if (seq != last_desired_pose_seq_) {
       const auto* dp = desired_pose_buffer_.readFromRT();
@@ -132,7 +212,8 @@ CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
                                   desired_pose_rt_.qz);
   if (desired_orientation.norm() < 1e-9) {
     desired_orientation = Quaterniond::Identity();
-  } else {
+  }
+  else {
     desired_orientation.normalize();
   }
 
@@ -163,6 +244,16 @@ CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
     command_interfaces_[i].set_value(tau_d(i));
   }
 
+  const bool blend_now =
+    blending_to_leader_.load(std::memory_order_relaxed) ||
+    (this->get_node()->now() < blend_running_hold_until_);
+  if (pub_blend_running_ && blend_now != last_blend_running_published_) {
+    std_msgs::msg::Bool m;
+    m.data = blend_now;
+    pub_blend_running_->publish(m);
+    last_blend_running_published_ = blend_now;
+  }
+
   return controller_interface::return_type::OK;
 }
 
@@ -177,15 +268,24 @@ CartesianImpedanceController::on_init() {
 
     auto_declare<std::string>("leader_robot_state_topic", "/leader/franka_robot_state_broadcaster/robot_state");
     auto_declare<std::string>("execution_pose_topic", "/execution/desired_pose");
-    auto_declare<double>("execution_pose_timeout", 7.0);
+    auto_declare<std::string>("execution_running_topic", "/execution/running");
+    auto_declare<std::string>("blend_running_topic", "/execution/blend_to_leader_running");
+
+    auto_declare<bool>("blend_to_leader_enabled", true);
+    // Larger => slower return to leader after prediction (duration = pos_m * a + ang_rad * b).
+    auto_declare<double>("blend_seconds_per_meter", 2.0);
+    auto_declare<double>("blend_seconds_per_rad", 1.2);
+    auto_declare<double>("blend_duration_min", 0.25);
+    auto_declare<double>("blend_duration_max", 8.0);
+    auto_declare<double>("blend_running_hold_sec", 0.5);
 
     auto_declare<bool>("move_to_start", false);
     auto_declare<std::vector<double>>(
         "start_joint_configuration",
         {0.0, -M_PI_4, 0.0, -3.0 * M_PI_4, 0.0, M_PI_2, M_PI_4});
 
-    auto_declare<std::vector<double>>("start_k_gains", {});
-    auto_declare<std::vector<double>>("start_d_gains", {});
+    auto_declare<std::vector<double>>("start_k_gains", { 600.0 ,600.0 ,600.0 ,600.0 ,250.0 ,150.0 ,50.0 });
+    auto_declare<std::vector<double>>("start_d_gains", { 30.0 ,30.0 ,30.0 ,30.0 ,10.0 ,10.0 ,5.0 });
 
     sub_leader_robot_state_ =
         get_node()->create_subscription<franka_msgs::msg::FrankaState>(
@@ -201,7 +301,20 @@ CartesianImpedanceController::on_init() {
             std::bind(&CartesianImpedanceController::executionDesiredPoseCallback, this,
                       std::placeholders::_1));
 
-  } catch (const std::exception& e) {
+    sub_execution_running_ =
+        get_node()->create_subscription<std_msgs::msg::Bool>(
+            get_node()->get_parameter("execution_running_topic").as_string(),
+            rclcpp::QoS(1).transient_local(),
+            std::bind(&CartesianImpedanceController::executionRunningCallback, this,
+                      std::placeholders::_1));
+
+    pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
+        get_node()->get_parameter("blend_running_topic").as_string(),
+        rclcpp::QoS(1).transient_local());
+
+  }
+
+  catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
   }
@@ -220,8 +333,17 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
       get_node()->get_parameter("leader_robot_state_topic").as_string();
   execution_pose_topic_ =
       get_node()->get_parameter("execution_pose_topic").as_string();
-  execution_pose_timeout_ =
-      get_node()->get_parameter("execution_pose_timeout").as_double();
+  execution_running_topic_ =
+      get_node()->get_parameter("execution_running_topic").as_string();
+  blend_running_topic_ =
+      get_node()->get_parameter("blend_running_topic").as_string();
+
+  blend_to_leader_enabled_ = get_node()->get_parameter("blend_to_leader_enabled").as_bool();
+  blend_seconds_per_meter_ = get_node()->get_parameter("blend_seconds_per_meter").as_double();
+  blend_seconds_per_rad_ = get_node()->get_parameter("blend_seconds_per_rad").as_double();
+  blend_duration_min_ = get_node()->get_parameter("blend_duration_min").as_double();
+  blend_duration_max_ = get_node()->get_parameter("blend_duration_max").as_double();
+  blend_running_hold_sec_ = get_node()->get_parameter("blend_running_hold_sec").as_double();
 
   move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
   const auto start_q = get_node()->get_parameter("start_joint_configuration").as_double_array();
@@ -284,7 +406,18 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
   last_desired_pose_seq_ = desired_pose_seq_.load(std::memory_order_acquire);
 
   desired_qn_ = Vector7d(franka_robot_model_->getRobotState()->q.data());
-  last_execution_pose_ns_.store(0, std::memory_order_release);
+
+  prev_execution_running_ = false;
+  execution_running_.store(false, std::memory_order_release);
+  pending_blend_to_leader_.store(false, std::memory_order_release);
+  blending_to_leader_.store(false, std::memory_order_release);
+  blend_running_hold_until_ = this->get_node()->now();
+  last_blend_running_published_ = false;
+  if (pub_blend_running_) {
+    std_msgs::msg::Bool m;
+    m.data = false;
+    pub_blend_running_->publish(m);
+  }
 
   stiffness_.setIdentity();
   stiffness_.topLeftCorner(3, 3) = pos_stiff_ * Matrix3d::Identity();
@@ -302,7 +435,8 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
     start_time_ = this->get_node()->now();
     mode_.store(static_cast<uint8_t>(Mode::MOVE_TO_START), std::memory_order_release);
     // accept_desired stays false until finished
-  } else {
+  }
+  else {
     mode_.store(static_cast<uint8_t>(Mode::CARTESIAN), std::memory_order_release);
     accept_desired_.store(true, std::memory_order_release);
   }
@@ -312,20 +446,17 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
 
 CallbackReturn
 CartesianImpedanceController::on_deactivate(const rclcpp_lifecycle::State& /*previous_state*/) {
+  if (pub_blend_running_) {
+    std_msgs::msg::Bool m;
+    m.data = false;
+    pub_blend_running_->publish(m);
+  }
   franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }
 
 void CartesianImpedanceController::leaderRobotStateCallback(
     const franka_msgs::msg::FrankaState& msg) {
-  if (!accept_desired_.load(std::memory_order_relaxed)) {
-    return;
-  }
-  // During predicted trajectory execution, ignore leader updates and follow execution poses.
-  if (executionPoseActive()) {
-    return;
-  }
-
   Eigen::Map<const Matrix4d> leader_T_EE(msg.o_t_ee.data());
 
   Vector3d pos = leader_T_EE.block<3, 1>(0, 3);
@@ -351,6 +482,18 @@ void CartesianImpedanceController::leaderRobotStateCallback(
   d.qx = ori.x();
   d.qy = ori.y();
   d.qz = ori.z();
+
+  leader_pose_cache_.writeFromNonRT(d);
+
+  if (!accept_desired_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (execution_running_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (blending_to_leader_.load(std::memory_order_relaxed)) {
+    return;
+  }
 
   desired_pose_buffer_.writeFromNonRT(d);
   desired_pose_seq_.fetch_add(1, std::memory_order_release);
@@ -394,18 +537,38 @@ void CartesianImpedanceController::executionDesiredPoseCallback(
 
   desired_pose_buffer_.writeFromNonRT(d);
   desired_pose_seq_.fetch_add(1, std::memory_order_release);
-  last_execution_pose_ns_.store(this->get_node()->now().nanoseconds(), std::memory_order_release);
 }
 
-bool CartesianImpedanceController::executionPoseActive() const {
-  const int64_t last_ns = last_execution_pose_ns_.load(std::memory_order_acquire);
-  if (last_ns <= 0) {
-    return false;
+void CartesianImpedanceController::executionRunningCallback(
+    const std_msgs::msg::Bool::SharedPtr msg) {
+  if (!msg) {
+    return;
   }
+  const bool now = msg->data;
+  const bool prev = prev_execution_running_;
+  prev_execution_running_ = now;
+  execution_running_.store(now, std::memory_order_release);
+  if (prev && !now) {
+    pending_blend_to_leader_.store(true, std::memory_order_release);
+  }
+}
 
-  const int64_t now_ns = this->get_node()->now().nanoseconds();
-  const double dt = static_cast<double>(now_ns - last_ns) * 1e-9;
-  return dt >= 0.0 && dt < execution_pose_timeout_;
+Quaterniond CartesianImpedanceController::quatFromDesiredPose(const DesiredPoseRT& p) {
+  Quaterniond q(p.qw, p.qx, p.qy, p.qz);
+  if (q.norm() < 1e-9) {
+    return Quaterniond::Identity();
+  }
+  q.normalize();
+  return q;
+}
+
+void CartesianImpedanceController::desiredPoseFromQuaternion(const Quaterniond& q_in, DesiredPoseRT* out) {
+  Quaterniond q = q_in;
+  q.normalize();
+  out->qw = q.w();
+  out->qx = q.x();
+  out->qy = q.y();
+  out->qz = q.z();
 }
 
 }  // namespace geo_gp_controllers

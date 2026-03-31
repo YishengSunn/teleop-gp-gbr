@@ -14,6 +14,7 @@
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <franka_msgs/msg/franka_state.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <realtime_tools/realtime_buffer.hpp>
@@ -54,7 +55,7 @@ public:
 private:
   static constexpr int num_joints = 7;
 
-  enum class Mode : uint8_t { MOVE_TO_START = 0, CARTESIAN = 1 };
+  enum class Mode : uint8_t { MOVE_TO_START = 0, CARTESIAN = 1, BLEND_TO_LEADER = 2 };
 
   struct DesiredPoseRT {
     double px{0.0}, py{0.0}, pz{0.0};
@@ -65,7 +66,14 @@ private:
   std::string arm_id_;
   std::string leader_robot_state_topic_{"/leader/franka_robot_state_broadcaster/robot_state"};
   std::string execution_pose_topic_{"/execution/desired_pose"};
-  double execution_pose_timeout_{0.2};
+  std::string execution_running_topic_{"/execution/running"};
+  std::string blend_running_topic_{"/execution/blend_to_leader_running"};
+  bool blend_to_leader_enabled_{true};
+  double blend_seconds_per_meter_{2.0};
+  double blend_seconds_per_rad_{1.2};
+  double blend_duration_min_{0.25};
+  double blend_duration_max_{8.0};
+  double blend_running_hold_sec_{0.5};
 
   double pos_stiff_{100.0};
   double rot_stiff_{10.0};
@@ -99,17 +107,35 @@ private:
   realtime_tools::RealtimeBuffer<DesiredPoseRT> desired_pose_buffer_;
   DesiredPoseRT desired_pose_rt_;
 
+  // Leader pose cache for blend-to-leader
+  realtime_tools::RealtimeBuffer<DesiredPoseRT> leader_pose_cache_;
+
   // Sequence gating to avoid applying stale desired after move_to_start
   std::atomic<uint64_t> desired_pose_seq_{0};
   uint64_t last_desired_pose_seq_{0};
 
+  std::atomic<bool> execution_running_{false};
+  bool prev_execution_running_{false};
+  std::atomic<bool> pending_blend_to_leader_{false};
+  std::atomic<bool> blending_to_leader_{false};
+
+  DesiredPoseRT blend_pose_start_{};
+  DesiredPoseRT blend_pose_goal_{};
+  rclcpp::Time blend_t0_{};
+  rclcpp::Time blend_running_hold_until_{};
+  double blend_duration_sec_{1.0};
+
   void leaderRobotStateCallback(const franka_msgs::msg::FrankaState& msg);
   void executionDesiredPoseCallback(const std_msgs::msg::Float64MultiArray& msg);
-  bool executionPoseActive() const;
+  void executionRunningCallback(const std_msgs::msg::Bool::SharedPtr msg);
+
+  static Quaterniond quatFromDesiredPose(const DesiredPoseRT& p);
+  static void desiredPoseFromQuaternion(const Quaterniond& q, DesiredPoseRT* out);
   rclcpp::Subscription<franka_msgs::msg::FrankaState>::SharedPtr sub_leader_robot_state_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_execution_pose_;
-
-  std::atomic<int64_t> last_execution_pose_ns_{0};
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_execution_running_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_blend_running_;
+  bool last_blend_running_published_{false};
 };
 
 }  // namespace geo_gp_controllers
