@@ -3,6 +3,13 @@
 using std::placeholders::_1;
 using namespace std::chrono_literals;
 
+namespace {
+void publish_running(const rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr& pub, bool running) {
+  std_msgs::msg::Bool msg;
+  msg.data = running;
+  pub->publish(msg);
+}
+}  // namespace
 
 TrajectoryExecutor::TrajectoryExecutor()
 : Node("trajectory_executor"),
@@ -15,11 +22,14 @@ TrajectoryExecutor::TrajectoryExecutor()
     output_topic_ = this->declare_parameter<std::string>(
         "output_topic", "/execution/desired_pose");
 
+    running_topic_ = this->declare_parameter<std::string>(
+        "running_topic", "/execution/running");
+
     publish_rate_ = this->declare_parameter<double>(
         "rate", 200.0);
 
     hold_time_ = this->declare_parameter<double>(
-        "hold_time", 0.5);
+        "hold_time", 0.0);
 
     sub_ = this->create_subscription<geo_gp_interfaces::msg::PredictedTrajectory>(
         input_topic_, 10,
@@ -30,6 +40,10 @@ TrajectoryExecutor::TrajectoryExecutor()
         output_topic_, 10
     );
 
+    pub_running_ = this->create_publisher<std_msgs::msg::Bool>(
+        running_topic_,
+        rclcpp::QoS(1).transient_local());
+
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_)),
         std::bind(&TrajectoryExecutor::timer_callback, this)
@@ -38,6 +52,9 @@ TrajectoryExecutor::TrajectoryExecutor()
     RCLCPP_INFO(this->get_logger(), "Trajectory Executor started.");
     RCLCPP_INFO(this->get_logger(), "Listening on: %s", input_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Publishing running flag to: %s", running_topic_.c_str());
+
+    publish_running(pub_running_, false);
 }
 
 void TrajectoryExecutor::trajectory_callback(
@@ -76,6 +93,8 @@ void TrajectoryExecutor::trajectory_callback(
     executing_ = true;
     start_time_ = this->now();
 
+    publish_running(pub_running_, true);
+
     const double planned_traj_time = trajectory_time_.empty() ? 0.0 : trajectory_time_.back();
     const double planned_total_time = hold_time_ + planned_traj_time;
     RCLCPP_INFO(this->get_logger(),
@@ -108,6 +127,7 @@ void TrajectoryExecutor::timer_callback() {
     if (exec_elapsed >= trajectory_time_.back()) {
         publish_pose(trajectory_.back());
         executing_ = false;
+        publish_running(pub_running_, false);
         const double total_elapsed = elapsed;
         RCLCPP_INFO(this->get_logger(),
             "Trajectory execution finished | actual_total=%.3f s | actual_traj=%.3f s | hold=%.3f s",
