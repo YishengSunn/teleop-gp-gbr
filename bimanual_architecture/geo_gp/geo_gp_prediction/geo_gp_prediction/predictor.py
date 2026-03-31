@@ -10,11 +10,15 @@ sys.path.append("/home/user/geo-gp")
 
 from config import Config
 from geometry.metrics import geom_mse
-from geometry.resample import resample_trajectory_3d_equal_dt
-from gp.model import rollout_reference_3d
+from geometry.resample import resample_trajectory_6d_equal_dt
+from gp.model import rollout_reference_6d
 from skills.skill_library import SkillLibrary
 from skills.skill_loader import load_skills_from_models
-from utils.misc import moving_average_centered_pos, smooth_prediction_by_velocity
+from utils.misc import (
+    moving_average_centered_pos,
+    moving_average_centered_6d,
+    smooth_prediction_by_twist_6d,
+)
 
 
 class Predictor:
@@ -40,7 +44,7 @@ class Predictor:
         # Load skill library
         self.skill_library = SkillLibrary()
 
-        skills = load_skills_from_models(model_dir, mode="3d")
+        skills = load_skills_from_models(model_dir, mode="6d")
 
         for s in skills:
             self.skill_library.add_skill(s)
@@ -77,7 +81,7 @@ class Predictor:
         Returns:
             float: The estimated speed of the prompt trajectory.
         """
-        prompt_pts = self.prompt_to_numpy(prompt_msg)
+        prompt_pts, _ = self.prompt_to_numpy(prompt_msg)
 
         if prompt_pts.shape[0] < 2:
             return self.default_speed
@@ -99,9 +103,11 @@ class Predictor:
             msg (PromptTrajectory): The input ROS PromptTrajectory message.
 
         Returns:
-            np.ndarray: A numpy array of shape (N, 3) containing the (x, y, z) coordinates of the prompt trajectory.
+            tuple[np.ndarray, np.ndarray]:
+                positions array of shape (N, 3) and quaternions array of shape (N, 4) in [w, x, y, z].
         """
         pts = []
+        quats = []
 
         for p in msg.poses:
             pts.append([
@@ -109,13 +115,20 @@ class Predictor:
                 p.position.y,
                 p.position.z
             ])
+            quats.append([
+                p.orientation.w,
+                p.orientation.x,
+                p.orientation.y,
+                p.orientation.z,
+            ])
 
-        return np.array(pts)
+        return np.array(pts), np.array(quats)
 
     def numpy_to_predicted(
         self,
         ref_msg: PromptTrajectory,
         pts: np.ndarray,
+        quats: np.ndarray = None,
         *,
         target_speed=None,
         skill_name="",
@@ -147,13 +160,20 @@ class Predictor:
         out.confidence = confidence
 
         # Poses
-        for p in pts:
+        for i, p in enumerate(pts):
             pose = Pose()
             pose.position.x = float(p[0])
             pose.position.y = float(p[1])
             pose.position.z = float(p[2])
 
-            pose.orientation = ref_msg.poses[-1].orientation
+            if quats is not None and i < len(quats):
+                q = quats[i]
+                pose.orientation.w = float(q[0])
+                pose.orientation.x = float(q[1])
+                pose.orientation.y = float(q[2])
+                pose.orientation.z = float(q[3])
+            else:
+                pose.orientation = ref_msg.poses[-1].orientation
 
             out.poses.append(pose)
 
@@ -187,10 +207,11 @@ class Predictor:
         self.logger.info(f"Target execution speed from prompt: {target_speed:.4f} m/s")
 
         # 1) ROS Path → numpy
-        probe = self.prompt_to_numpy(prompt_msg)
+        probe, probe_quat = self.prompt_to_numpy(prompt_msg)
 
-        probe_eq = resample_trajectory_3d_equal_dt(
+        probe_eq, probe_quat_eq = resample_trajectory_6d_equal_dt(
             probe,
+            probe_quat,
             sample_hz=self.sample_hz,
             speed=self.default_speed)
 
@@ -199,6 +220,7 @@ class Predictor:
             return self.numpy_to_predicted(
                 prompt_msg,
                 probe,
+                probe_quat,
                 target_speed=target_speed,
                 skill_name="",
                 success=False,
@@ -206,6 +228,7 @@ class Predictor:
             )
 
         probe_eq = moving_average_centered_pos(probe_eq, self.smooth_win)
+        probe_quat_eq = moving_average_centered_6d(probe_quat_eq, self.smooth_win)
 
         # 2) Skill matching
         skill, (R, s, t, j_end) = self.skill_library.match(probe_eq)
@@ -221,30 +244,38 @@ class Predictor:
 
         # 4) Rollout
         preds = None
+        preds_quat = None
 
         for attempt in range(self.max_retries):
             cur_hist = probe_in_ref.copy()
+            cur_quat = probe_quat_eq.copy()[:cur_hist.shape[0]]
             preds_world = []
+            preds_world_quat = []
             failed = False
 
             for step in range(self.rollout_horizon):
-                preds_ref, _, _, vars_ref = rollout_reference_3d(
+                preds_ref_pos, preds_ref_quat, _, _, vars_ref = rollout_reference_6d(
                     model,
                     torch.tensor(cur_hist, dtype=torch.float32),
+                    torch.tensor(cur_quat, dtype=torch.float32),
                     start_t=cur_hist.shape[0] - 1,
                     h=1,
                     k=self.k,
                     input_type="spherical",
                     output_type="delta",
+                    R_ref_probe=R,
                 )
 
-                next_ref = preds_ref[-1].numpy()
+                next_ref = preds_ref_pos[-1].numpy()
 
                 # Ref → Probe/World frame
                 next_world = s * (next_ref @ R.T) + t
+                next_world_quat = preds_ref_quat[-1].numpy()
                 preds_world.append(next_world)
+                preds_world_quat.append(next_world_quat)
 
                 cur_hist = np.vstack([cur_hist, next_ref])
+                cur_quat = np.vstack([cur_quat, next_world_quat[None, :]])
 
                 # Goal stopping
                 d = np.linalg.norm(next_world - probe_goal)
@@ -262,6 +293,7 @@ class Predictor:
 
             if not failed:
                 preds_world = np.asarray(preds_world)
+                preds_world_quat = np.asarray(preds_world_quat)
 
                 probe_end = probe_eq[-1]
                 dists = np.linalg.norm(preds_world - probe_end, axis=1)
@@ -273,6 +305,7 @@ class Predictor:
                 else:
                     i_start = int(candidate_idxs[0])
                     preds = preds_world[i_start:]
+                    preds_quat = preds_world_quat[i_start:]
                     break
 
             # Retry: drop tail
@@ -286,17 +319,21 @@ class Predictor:
             self.logger.info("[Predict] Failed")
             return self.numpy_to_predicted(prompt_msg,
                 probe_eq,
+                probe_quat_eq,
                 target_speed=target_speed,
                 skill_name=skill.name,
                 success=False,
                 confidence=0.0)
 
         # 5) Smoothing
-        preds = smooth_prediction_by_velocity(
-            probe=probe_eq,
-            pred=preds,
+        preds, preds_quat = smooth_prediction_by_twist_6d(
+            probe_pos=probe_eq,
+            probe_quat=probe_quat_eq,
+            pred_pos=preds,
+            pred_quat=preds_quat,
             win=self.smooth_win,
-            blend_first_step=0.5,
+            blend_first_step_pos=0.5,
+            blend_first_step_rot=0.5,
         )
 
         self.logger.info(f"[Predict] Done: {preds.shape}")
@@ -304,6 +341,7 @@ class Predictor:
         # 6) Numpy → ROS Path
         return self.numpy_to_predicted(prompt_msg,
             preds,
+            preds_quat,
             target_speed=target_speed,
             skill_name=skill.name,
             success=True,

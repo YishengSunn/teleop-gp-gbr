@@ -1,3 +1,4 @@
+import time
 import rclpy
 from rclpy.node import Node
 
@@ -36,7 +37,11 @@ class PredictionNode(Node):
         n = len(msg.poses)
         self.get_logger().info(f"Received prompt trajectory with {n} poses")
 
+        t0 = time.perf_counter()
         pred = self.predictor.predict(msg)
+        elapsed_s = time.perf_counter() - t0
+
+        self.get_logger().info(f"Prediction took {elapsed_s * 1000.0:.2f} ms ({elapsed_s:.4f} s)")
 
         self.pred_pub.publish(pred)
 
