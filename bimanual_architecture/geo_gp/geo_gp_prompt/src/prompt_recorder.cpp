@@ -14,15 +14,31 @@ PromptRecorder::PromptRecorder()
 
     input_topic_ = this->declare_parameter<std::string>(
         "input_topic",
-        "/leader/franka_robot_state_broadcaster/robot_state");
+        "/follower/franka_robot_state_broadcaster/robot_state");
 
     output_topic_ = this->declare_parameter<std::string>(
         "output_topic",
         "/gp_prompt_trajectory");
 
+    execution_running_topic_ = this->declare_parameter<std::string>(
+        "execution_running_topic",
+        "/execution/running");
+    blend_running_topic_ = this->declare_parameter<std::string>(
+        "blend_running_topic",
+        "/execution/blend_to_leader_running");
+
     pose_sub_ = this->create_subscription<franka_msgs::msg::FrankaState>(
         input_topic_, 10,
         std::bind(&PromptRecorder::pose_callback, this, _1)
+    );
+
+    execution_running_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        execution_running_topic_, 10,
+        std::bind(&PromptRecorder::execution_running_callback, this, _1)
+    );
+    blend_running_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        blend_running_topic_, 10,
+        std::bind(&PromptRecorder::blend_running_callback, this, _1)
     );
 
     prompt_pub_ = this->create_publisher<geo_gp_interfaces::msg::PromptTrajectory>(
@@ -32,10 +48,43 @@ PromptRecorder::PromptRecorder()
     RCLCPP_INFO(this->get_logger(), "Prompt Recorder started.");
     RCLCPP_INFO(this->get_logger(), "Listening on: %s", input_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Execution running topic: %s", execution_running_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Blend running topic: %s", blend_running_topic_.c_str());
+}
+
+void PromptRecorder::execution_running_callback(
+    const std_msgs::msg::Bool::SharedPtr msg) {
+    execution_running_ = msg->data;
+}
+
+void PromptRecorder::blend_running_callback(
+    const std_msgs::msg::Bool::SharedPtr msg) {
+    if (msg->data != blend_running_) {
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Blend-to-leader %s",
+            msg->data ? "START (record disabled)" : "END (record enabled)");
+    }
+    blend_running_ = msg->data;
 }
 
 void PromptRecorder::pose_callback(
     const franka_msgs::msg::FrankaState::SharedPtr msg) {
+    if (execution_running_ || blend_running_) {
+        if (blend_running_) {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(), *this->get_clock(), 1000,
+                "Skipping prompt recording while blend_to_leader is active");
+        }
+        if (state_ != State::IDLE) {
+            poses_.clear();
+            time_from_start_.clear();
+            moving_counter_ = 0;
+            stop_counter_ = 0;
+            state_ = State::IDLE;
+        }
+        return;
+    }
 
     auto now = this->now();
 
