@@ -28,7 +28,6 @@ private:
     std::string output_topic_;
     std::string running_topic_;
     double publish_rate_;
-    double hold_time_;
 
     size_t index_;
     bool executing_;

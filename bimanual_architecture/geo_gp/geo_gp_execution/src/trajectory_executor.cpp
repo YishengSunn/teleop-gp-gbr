@@ -18,18 +18,12 @@ TrajectoryExecutor::TrajectoryExecutor()
 
     input_topic_ = this->declare_parameter<std::string>(
         "input_topic", "/gp_predicted_trajectory");
-
     output_topic_ = this->declare_parameter<std::string>(
         "output_topic", "/execution/desired_pose");
-
     running_topic_ = this->declare_parameter<std::string>(
         "running_topic", "/execution/running");
-
     publish_rate_ = this->declare_parameter<double>(
         "rate", 200.0);
-
-    hold_time_ = this->declare_parameter<double>(
-        "hold_time", 0.0);
 
     sub_ = this->create_subscription<geo_gp_interfaces::msg::PredictedTrajectory>(
         input_topic_, 10,
@@ -50,9 +44,6 @@ TrajectoryExecutor::TrajectoryExecutor()
     );
 
     RCLCPP_INFO(this->get_logger(), "Trajectory Executor started.");
-    RCLCPP_INFO(this->get_logger(), "Listening on: %s", input_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Publishing running flag to: %s", running_topic_.c_str());
 
     publish_running(pub_running_, false);
 }
@@ -94,15 +85,6 @@ void TrajectoryExecutor::trajectory_callback(
     start_time_ = this->now();
 
     publish_running(pub_running_, true);
-
-    const double planned_traj_time = trajectory_time_.empty() ? 0.0 : trajectory_time_.back();
-    const double planned_total_time = hold_time_ + planned_traj_time;
-    RCLCPP_INFO(this->get_logger(),
-        "Received predicted trajectory with %zu poses | planned_traj=%.3f s | hold=%.3f s | planned_total=%.3f s",
-        trajectory_.size(),
-        planned_traj_time,
-        hold_time_,
-        planned_total_time);
 }
 
 void TrajectoryExecutor::timer_callback() {
@@ -112,35 +94,25 @@ void TrajectoryExecutor::timer_callback() {
 
     double elapsed = (this->now() - start_time_).seconds();
 
-    if (elapsed < hold_time_) {
-        publish_pose(trajectory_.front());
-        return;
-    }
-
-    const double exec_elapsed = elapsed - hold_time_;
-
     while (index_ + 1 < trajectory_time_.size() &&
-           trajectory_time_[index_ + 1] <= exec_elapsed) {
+           trajectory_time_[index_ + 1] <= elapsed) {
         ++index_;
     }
 
-    if (exec_elapsed >= trajectory_time_.back()) {
+    if (elapsed >= trajectory_time_.back()) {
         publish_pose(trajectory_.back());
         executing_ = false;
         publish_running(pub_running_, false);
-        const double total_elapsed = elapsed;
         RCLCPP_INFO(this->get_logger(),
-            "Trajectory execution finished | actual_total=%.3f s | actual_traj=%.3f s | hold=%.3f s",
-            total_elapsed,
-            exec_elapsed,
-            hold_time_);
+            "Trajectory execution finished | elapsed=%.3f s",
+            elapsed);
         return;
     }
 
     publish_pose(trajectory_[index_]);
-    
+
     if (index_ + 1 < trajectory_.size() &&
-        trajectory_time_[index_ + 1] <= exec_elapsed) {
+        trajectory_time_[index_ + 1] <= elapsed) {
         ++index_;
     }
 }
