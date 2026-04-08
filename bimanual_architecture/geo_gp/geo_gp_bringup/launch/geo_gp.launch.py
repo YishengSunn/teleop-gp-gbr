@@ -13,7 +13,9 @@ def generate_launch_description():
                 "input_topic": "/follower/franka_robot_state_broadcaster/robot_state",
                 "output_topic": "/gp_prompt_trajectory",
                 "execution_running_topic": "/execution/running",
-                "blend_running_topic": "/execution/blend_to_leader_running"
+                "blend_running_topic": "/execution/blend_to_leader_running",
+                "online_mode": True,
+                "publish_period_ms": 2000,
             }]
         ),
         Node(
@@ -25,7 +27,8 @@ def generate_launch_description():
                 "config_path": "/home/user/geo-gp/config/default.yaml",
                 "model_dir": "/home/user/geo-gp/data/02-26/models/6d",
                 "input_topic": "/gp_prompt_trajectory",
-                "output_topic": "/gp_predicted_trajectory"
+                "output_topic": "/gp_predicted_trajectory",
+                "execution_running_topic": "/execution/running",
             }]
         ),
         Node(

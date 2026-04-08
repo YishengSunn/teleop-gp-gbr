@@ -1,5 +1,8 @@
 import rclpy
+import threading
 from rclpy.node import Node
+from std_msgs.msg import Bool
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from geo_gp_interfaces.msg import PromptTrajectory, PredictedTrajectory
 from .predictor import Predictor
@@ -10,40 +13,133 @@ class PredictionNode(Node):
         super().__init__('prediction_node')
         self.declare_parameter("config_path", "")
         self.declare_parameter("model_dir", "")
+        self.declare_parameter("input_topic", "/gp_prompt_trajectory")
+        self.declare_parameter("output_topic", "/gp_predicted_trajectory")
+        self.declare_parameter("execution_running_topic", "/execution/running")
 
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value
+        input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
+        output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
+        execution_running_topic = self.get_parameter(
+            "execution_running_topic"
+        ).get_parameter_value().string_value
         self.predictor = Predictor(self.get_logger(), config_path, model_dir)
+        self.qos_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.state_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._lock = threading.Lock()
+        self._wake_event = threading.Event()
+        self._shutdown = False
+        self._latest_prompt = None
+        self._latest_seq = 0
+        self._worker_busy = False
+        self._last_published_seq = 0
+        self._execution_running = False
 
         # Subscriber
         self.prompt_sub = self.create_subscription(
             PromptTrajectory,
-            '/gp_prompt_trajectory',
+            input_topic,
             self.prompt_callback,
-            10
+            self.qos_profile
+        )
+        self.execution_running_sub = self.create_subscription(
+            Bool,
+            execution_running_topic,
+            self.execution_running_callback,
+            self.state_qos,
         )
 
         # Publisher
         self.pred_pub = self.create_publisher(
             PredictedTrajectory,
-            '/gp_predicted_trajectory',
-            10
+            output_topic,
+            self.qos_profile
         )
+        self._worker = threading.Thread(target=self._prediction_worker, daemon=True)
+        self._worker.start()
 
         self.get_logger().info("Geo GP Prediction Node Started")
 
     def prompt_callback(self, msg: PromptTrajectory):
         n = len(msg.poses)
-        self.get_logger().info(f"Received prompt trajectory with {n} poses")
+        with self._lock:
+            if self._execution_running:
+                self.get_logger().info(
+                    f"Dropping prompt trajectory with {n} poses because execution is running"
+                )
+                return
+            self._latest_seq += 1
+            seq = self._latest_seq
+            self._latest_prompt = (seq, msg)
 
-        pred = self.predictor.predict(msg)
+        self.get_logger().info(f"Queued prompt trajectory seq={seq} with {n} poses")
+        self._wake_event.set()
 
-        self.pred_pub.publish(pred)
+    def execution_running_callback(self, msg: Bool):
+        with self._lock:
+            was_running = self._execution_running
+            self._execution_running = msg.data
+            if msg.data:
+                self._latest_prompt = None
 
-        self.get_logger().info(
-            f"Published predicted trajectory | success={pred.success} | skill={pred.skill_name} | "
-            f"confidence={pred.confidence}"
-        )
+    def _prediction_worker(self):
+        while True:
+            self._wake_event.wait()
+            self._wake_event.clear()
+
+            while True:
+                with self._lock:
+                    if self._shutdown:
+                        return
+                    if self._latest_prompt is None:
+                        self._worker_busy = False
+                        break
+                    if self._execution_running:
+                        self._latest_prompt = None
+                        self._worker_busy = False
+                        break
+
+                    self._worker_busy = True
+                    seq, msg = self._latest_prompt
+                    self._latest_prompt = None
+
+                self.get_logger().info(
+                    f"Starting prediction for latest prompt seq={seq} with {len(msg.poses)} poses"
+                )
+                pred = self.predictor.predict(msg)
+                with self._lock:
+                    execution_running = self._execution_running
+
+                if execution_running:
+                    self.get_logger().info(
+                        f"Skipping predicted trajectory publish for seq={seq} because execution is running"
+                    )
+                    continue
+
+                self.pred_pub.publish(pred)
+                self._last_published_seq = seq
+                self.get_logger().info(
+                    f"Published predicted trajectory | seq={seq} | success={pred.success} | "
+                    f"skill={pred.skill_name} | confidence={pred.confidence}"
+                )
+
+    def destroy_node(self):
+        with self._lock:
+            self._shutdown = True
+        self._wake_event.set()
+        if self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+        return super().destroy_node()
 
 
 def main(args=None):

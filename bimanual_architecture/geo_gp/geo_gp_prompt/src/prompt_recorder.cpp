@@ -11,6 +11,7 @@ PromptRecorder::PromptRecorder()
   stop_threshold_(0.02) {
 
     state_ = State::IDLE;
+    last_online_publish_time_ = this->now();
 
     input_topic_ = this->declare_parameter<std::string>(
         "input_topic",
@@ -23,33 +24,39 @@ PromptRecorder::PromptRecorder()
     execution_running_topic_ = this->declare_parameter<std::string>(
         "execution_running_topic",
         "/execution/running");
+
     blend_running_topic_ = this->declare_parameter<std::string>(
         "blend_running_topic",
         "/execution/blend_to_leader_running");
 
+    online_mode_ = this->declare_parameter<bool>("online_mode", false);
+    publish_period_ms_ = this->declare_parameter<int>("publish_period_ms", 150);
+    const auto latest_only_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+
     pose_sub_ = this->create_subscription<franka_msgs::msg::FrankaState>(
-        input_topic_, 10,
+        input_topic_, latest_only_qos,
         std::bind(&PromptRecorder::pose_callback, this, _1)
     );
 
     execution_running_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-        execution_running_topic_, 10,
+        execution_running_topic_, latest_only_qos,
         std::bind(&PromptRecorder::execution_running_callback, this, _1)
     );
+
     blend_running_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-        blend_running_topic_, 10,
+        blend_running_topic_, latest_only_qos,
         std::bind(&PromptRecorder::blend_running_callback, this, _1)
     );
 
     prompt_pub_ = this->create_publisher<geo_gp_interfaces::msg::PromptTrajectory>(
-        output_topic_, 10
+        output_topic_, latest_only_qos
     );
 
     RCLCPP_INFO(this->get_logger(), "Prompt Recorder started.");
-    RCLCPP_INFO(this->get_logger(), "Listening on: %s", input_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Publishing to: %s", output_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Execution running topic: %s", execution_running_topic_.c_str());
-    RCLCPP_INFO(this->get_logger(), "Blend running topic: %s", blend_running_topic_.c_str());
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Online mode: %s | period=%d ms",
+        online_mode_ ? "enabled" : "disabled", publish_period_ms_);
 }
 
 void PromptRecorder::execution_running_callback(
@@ -63,29 +70,13 @@ void PromptRecorder::blend_running_callback(
         RCLCPP_INFO(
             this->get_logger(),
             "Blend-to-leader %s",
-            msg->data ? "START (record disabled)" : "END (record enabled)");
+            msg->data ? "START" : "END");
     }
     blend_running_ = msg->data;
 }
 
 void PromptRecorder::pose_callback(
     const franka_msgs::msg::FrankaState::SharedPtr msg) {
-    if (execution_running_ || blend_running_) {
-        if (blend_running_) {
-            RCLCPP_INFO_THROTTLE(
-                this->get_logger(), *this->get_clock(), 1000,
-                "Skipping prompt recording while blend_to_leader is active");
-        }
-        if (state_ != State::IDLE) {
-            poses_.clear();
-            time_from_start_.clear();
-            moving_counter_ = 0;
-            stop_counter_ = 0;
-            state_ = State::IDLE;
-        }
-        return;
-    }
-
     auto now = this->now();
 
     // 1. Detect motion based on joint velocities
@@ -122,6 +113,7 @@ void PromptRecorder::pose_callback(
                 poses_.clear();
                 time_from_start_.clear();
                 motion_start_time_ = now;
+                last_online_publish_time_ = now;
                 poses_.push_back(pose);
                 time_from_start_.push_back(0.0);
 
@@ -137,8 +129,10 @@ void PromptRecorder::pose_callback(
             poses_.push_back(pose);
             time_from_start_.push_back((now - motion_start_time_).seconds());
 
-            if (poses_.size() > 2000) poses_.erase(poses_.begin());
-            if (time_from_start_.size() > 2000) time_from_start_.erase(time_from_start_.begin());
+            if (online_mode_ && can_publish_online()) {
+                publish_prompt();
+                last_online_publish_time_ = now;
+            }
 
             if (dq_norm < stop_threshold_) stop_counter_++;
             else stop_counter_ = 0;
@@ -153,11 +147,18 @@ void PromptRecorder::pose_callback(
         }
 
         case State::STOPPING: {
+            if (publish_paused()) {
+                RCLCPP_INFO_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 1000,
+                    "Prompt publish paused while execution or blend is active");
+                break;
+            }
+
             if (poses_.size() >= min_points_) {
                 publish_prompt();
 
                 RCLCPP_INFO(this->get_logger(),
-                    "STOPPING -> IDLE (sent %zu poses)", poses_.size());
+                    "STOPPING -> IDLE");
             }
             else {
                 RCLCPP_WARN(this->get_logger(),
@@ -170,6 +171,20 @@ void PromptRecorder::pose_callback(
             break;
         }
     }
+}
+
+bool PromptRecorder::publish_paused() const {
+    return execution_running_ || blend_running_;
+}
+
+bool PromptRecorder::can_publish_online() const {
+    if (!online_mode_) return false;
+
+    if (poses_.size() < min_points_) return false;
+
+    const double elapsed_ms =
+        (this->now() - last_online_publish_time_).seconds() * 1000.0;
+    return elapsed_ms >= static_cast<double>(publish_period_ms_) && !publish_paused();
 }
 
 void PromptRecorder::publish_prompt() {
@@ -185,7 +200,9 @@ void PromptRecorder::publish_prompt() {
     prompt_pub_->publish(msg);
 
     RCLCPP_INFO(this->get_logger(),
-        "Published prompt trajectory with %zu poses.", poses_.size());
+        "Published %s prompt trajectory with %zu poses.",
+        online_mode_ ? "online-prefix" : "final-trajectory",
+        msg.poses.size());
 }
 
 int main(int argc, char ** argv) {

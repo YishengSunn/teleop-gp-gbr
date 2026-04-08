@@ -1,12 +1,15 @@
 #pragma once
 
+#include <chrono>
+#include <string>
+#include <vector>
+#include <Eigen/Dense>
+
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <franka_msgs/msg/franka_state.hpp>
 #include <geo_gp_interfaces/msg/prompt_trajectory.hpp>
 #include <std_msgs/msg/bool.hpp>
-
-#include <Eigen/Dense>
 
 
 class PromptRecorder : public rclcpp::Node {
@@ -17,6 +20,8 @@ private:
     void pose_callback(const franka_msgs::msg::FrankaState::SharedPtr msg);
     void execution_running_callback(const std_msgs::msg::Bool::SharedPtr msg);
     void blend_running_callback(const std_msgs::msg::Bool::SharedPtr msg);
+    bool publish_paused() const;
+    bool can_publish_online() const;
     void publish_prompt();
 
     // ROS
@@ -47,6 +52,10 @@ private:
     double start_threshold_;
     double stop_threshold_;
     size_t min_points_ = 10;
+    bool online_mode_ = false;
+    int publish_period_ms_ = 150;
+    size_t publish_min_points_ = 10;
+    rclcpp::Time last_online_publish_time_;
 
     // State machine
     enum class State {
