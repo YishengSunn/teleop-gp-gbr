@@ -9,12 +9,13 @@ The key goal is to use short human prompt motions to trigger GP-based trajectory
 2. `prediction_node` loads GP skills (6D models) and predicts `PredictedTrajectory` on `/gp_predicted_trajectory`.
 3. `trajectory_executor` converts predicted trajectory into `/execution/desired_pose` and publishes `/execution/running`.
 4. `cartesian_impedance_controller` tracks execution pose and can blend back to leader after execution.
-5. During execution/blend, `prompt_recorder` is gated by state topics to avoid self-triggered re-recording loops.
+5. `geo_gp_toggle` publishes `/geo_gp/enabled` so Geo-GP can be enabled or disabled at runtime.
+6. During execution/blend, `prompt_recorder` is gated by state topics to avoid self-triggered re-recording loops.
 
 ## Main Packages
 
 - `bimanual_architecture/geo_gp/geo_gp_prompt`: prompt capture (`prompt_recorder`)
-- `bimanual_architecture/geo_gp/geo_gp_prediction`: GP inference (`prediction_node`, `predictor.py`)
+- `bimanual_architecture/geo_gp/geo_gp_prediction`: GP inference (`prediction_node`, `predictor.py`, `geo_gp_toggle`)
 - `bimanual_architecture/geo_gp/geo_gp_execution`: trajectory execution (`trajectory_executor`)
 - `bimanual_architecture/geo_gp/geo_gp_controllers`: follower/leader controllers and broadcasters
 - `bimanual_architecture/geo_gp/geo_gp_bringup`: launch and controller config
@@ -34,6 +35,29 @@ ros2 launch geo_gp_bringup single_arm.launch.py robot_ip:=<ip> ns:=follower arm_
 ros2 launch geo_gp_bringup geo_gp.launch.py
 ```
 
+This launch wires `/geo_gp/enabled` into both `prompt_recorder` and `prediction_node`.
+By default, prompt recording and prediction stay disabled until that topic is set to `true`.
+
+### 3) Enable or disable Geo-GP from a separate terminal
+
+Run the keyboard toggle node:
+
+```bash
+ros2 run geo_gp_prediction geo_gp_toggle
+```
+
+Controls:
+
+- `g` then Enter: toggle Geo-GP enabled/disabled
+- `q` then Enter: quit the toggle node
+
+You can also publish the state manually:
+
+```bash
+ros2 topic pub /geo_gp/enabled std_msgs/msg/Bool "{data: true}" --once
+ros2 topic pub /geo_gp/enabled std_msgs/msg/Bool "{data: false}" --once
+```
+
 ## Key Config
 
 - `geo_gp_bringup/config/single_controllers.yaml`
@@ -43,6 +67,7 @@ ros2 launch geo_gp_bringup geo_gp.launch.py
   - prompt source topic (currently follower)
   - GP model directory
   - execution topics (`/execution/desired_pose`, `/execution/running`)
+  - Geo-GP enable topic (`/geo_gp/enabled`)
 
 ## Optional Tool
 
