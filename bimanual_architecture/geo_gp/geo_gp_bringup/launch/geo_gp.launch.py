@@ -14,7 +14,8 @@ def generate_launch_description():
                 "output_topic": "/gp_prompt_trajectory",
                 "execution_running_topic": "/execution/running",
                 "blend_running_topic": "/execution/blend_to_leader_running",
-                "online_mode": True,
+                "enabled_topic": "/geo_gp/enabled",
+                "online_mode": False,
                 "publish_period_ms": 2000,
             }]
         ),
@@ -29,6 +30,7 @@ def generate_launch_description():
                 "input_topic": "/gp_prompt_trajectory",
                 "output_topic": "/gp_predicted_trajectory",
                 "execution_running_topic": "/execution/running",
+                "enabled_topic": "/geo_gp/enabled",
             }]
         ),
         Node(

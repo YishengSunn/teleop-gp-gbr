@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'prediction_node = geo_gp_prediction.prediction_node:main',
+            'geo_gp_toggle = geo_gp_prediction.geo_gp_toggle:main',
         ],
     },
 )

@@ -20,6 +20,8 @@ private:
     void pose_callback(const franka_msgs::msg::FrankaState::SharedPtr msg);
     void execution_running_callback(const std_msgs::msg::Bool::SharedPtr msg);
     void blend_running_callback(const std_msgs::msg::Bool::SharedPtr msg);
+    void enabled_callback(const std_msgs::msg::Bool::SharedPtr msg);
+    void reset_recording_state();
     bool publish_paused() const;
     bool can_publish_online() const;
     void publish_prompt();
@@ -28,6 +30,7 @@ private:
     rclcpp::Subscription<franka_msgs::msg::FrankaState>::SharedPtr pose_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr execution_running_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr blend_running_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enabled_sub_;
     rclcpp::Publisher<geo_gp_interfaces::msg::PromptTrajectory>::SharedPtr prompt_pub_;
 
     // Data
@@ -40,8 +43,10 @@ private:
     std::string output_topic_;
     std::string execution_running_topic_;
     std::string blend_running_topic_;
+    std::string enabled_topic_;
     bool execution_running_ = false;
     bool blend_running_ = false;
+    bool enabled_ = false;
 
     int moving_counter_ = 0;
     int stop_counter_ = 0;

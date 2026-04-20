@@ -28,10 +28,14 @@ PromptRecorder::PromptRecorder()
     blend_running_topic_ = this->declare_parameter<std::string>(
         "blend_running_topic",
         "/execution/blend_to_leader_running");
+    enabled_topic_ = this->declare_parameter<std::string>(
+        "enabled_topic",
+        "/geo_gp/enabled");
 
     online_mode_ = this->declare_parameter<bool>("online_mode", false);
     publish_period_ms_ = this->declare_parameter<int>("publish_period_ms", 150);
     const auto latest_only_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    const auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
 
     pose_sub_ = this->create_subscription<franka_msgs::msg::FrankaState>(
         input_topic_, latest_only_qos,
@@ -47,6 +51,10 @@ PromptRecorder::PromptRecorder()
         blend_running_topic_, latest_only_qos,
         std::bind(&PromptRecorder::blend_running_callback, this, _1)
     );
+    enabled_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        enabled_topic_, latched_qos,
+        std::bind(&PromptRecorder::enabled_callback, this, _1)
+    );
 
     prompt_pub_ = this->create_publisher<geo_gp_interfaces::msg::PromptTrajectory>(
         output_topic_, latest_only_qos
@@ -61,11 +69,18 @@ PromptRecorder::PromptRecorder()
 
 void PromptRecorder::execution_running_callback(
     const std_msgs::msg::Bool::SharedPtr msg) {
+    if (msg->data && !execution_running_) {
+        reset_recording_state();
+        RCLCPP_INFO(this->get_logger(), "Execution START");
+    }
     execution_running_ = msg->data;
 }
 
 void PromptRecorder::blend_running_callback(
     const std_msgs::msg::Bool::SharedPtr msg) {
+    if (msg->data && !blend_running_) {
+        reset_recording_state();
+    }
     if (msg->data != blend_running_) {
         RCLCPP_INFO(
             this->get_logger(),
@@ -75,8 +90,38 @@ void PromptRecorder::blend_running_callback(
     blend_running_ = msg->data;
 }
 
+void PromptRecorder::enabled_callback(
+    const std_msgs::msg::Bool::SharedPtr msg) {
+    if (enabled_ == msg->data) {
+        return;
+    }
+
+    enabled_ = msg->data;
+    last_online_publish_time_ = this->now();
+
+    if (!enabled_) {
+        reset_recording_state();
+    }
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Geo-GP prompt recorder %s",
+        enabled_ ? "ENABLED" : "DISABLED");
+}
+
 void PromptRecorder::pose_callback(
     const franka_msgs::msg::FrankaState::SharedPtr msg) {
+    if (!enabled_) {
+        return;
+    }
+
+    if (publish_paused()) {
+        if (state_ != State::IDLE) {
+            reset_recording_state();
+        }
+        return;
+    }
+
     auto now = this->now();
 
     // 1. Detect motion based on joint velocities
@@ -173,8 +218,16 @@ void PromptRecorder::pose_callback(
     }
 }
 
+void PromptRecorder::reset_recording_state() {
+    poses_.clear();
+    time_from_start_.clear();
+    moving_counter_ = 0;
+    stop_counter_ = 0;
+    state_ = State::IDLE;
+}
+
 bool PromptRecorder::publish_paused() const {
-    return execution_running_ || blend_running_;
+    return !enabled_ || execution_running_ || blend_running_;
 }
 
 bool PromptRecorder::can_publish_online() const {
