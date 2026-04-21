@@ -76,9 +76,11 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_init() {
     // If true, add feedback on top during move-to-start
     auto_declare<bool>("feedback_additive", false);
 
-    // trajectory_executor publishes Bool on execution_running_topic (true while executing).
+    // Trajectory_executor publishes Bool on execution_running_topic (true while executing).
+    // Cartesian_impedance_controller publishes blend_to_leader state on blend_running_topic.
     auto_declare<bool>("suppress_feedback_during_execution", true);
     auto_declare<std::string>("execution_running_topic", "/execution/running");
+    auto_declare<std::string>("blend_running_topic", "/execution/blend_to_leader_running");
     auto_declare<double>("execution_feedback_scale", 0.0);
   }
   
@@ -127,6 +129,7 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
   suppress_feedback_during_execution_ =
     get_node()->get_parameter("suppress_feedback_during_execution").as_bool();
   execution_running_topic_ = get_node()->get_parameter("execution_running_topic").as_string();
+  blend_running_topic_ = get_node()->get_parameter("blend_running_topic").as_string();
   execution_feedback_scale_ = get_node()->get_parameter("execution_feedback_scale").as_double();
 
   // Move-to-start goal
@@ -169,7 +172,9 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
   // (Re)subscribe only if feedback is enabled
   tau_sub_.reset();
   execution_running_sub_.reset();
+  blend_running_sub_.reset();
   execution_running_.store(false, std::memory_order_release);
+  blend_running_.store(false, std::memory_order_release);
 
   if (enable_feedback_) {
     tau_sub_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -183,6 +188,11 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
           execution_running_topic_,
           rclcpp::QoS(1).transient_local(),
           [this](const std_msgs::msg::Bool::SharedPtr msg) { onExecutionRunning(*msg); });
+      blend_running_sub_ =
+        get_node()->create_subscription<std_msgs::msg::Bool>(
+          blend_running_topic_,
+          rclcpp::QoS(1).transient_local(),
+          [this](const std_msgs::msg::Bool::SharedPtr msg) { onBlendRunning(*msg); });
     }
 
     RCLCPP_INFO(get_node()->get_logger(),
@@ -194,8 +204,9 @@ CallbackReturn GravityCompensationWithJointTorqueFeedbackController::on_configur
     if (suppress_feedback_during_execution_) {
       RCLCPP_INFO(
         get_node()->get_logger(),
-        "Execution-aware feedback: running_topic=%s scale_while_executing=%.4f",
+        "Execution-aware feedback: running_topic=%s blend_topic=%s scale_while_active=%.4f",
         execution_running_topic_.c_str(),
+        blend_running_topic_.c_str(),
         execution_feedback_scale_);
     }
   } 
@@ -360,11 +371,19 @@ void GravityCompensationWithJointTorqueFeedbackController::onExecutionRunning(
   execution_running_.store(msg.data, std::memory_order_release);
 }
 
+void GravityCompensationWithJointTorqueFeedbackController::onBlendRunning(
+  const std_msgs::msg::Bool& msg) {
+  blend_running_.store(msg.data, std::memory_order_release);
+}
+
 double GravityCompensationWithJointTorqueFeedbackController::effectiveFeedbackScale() const {
   if (!suppress_feedback_during_execution_) {
     return feedback_scale_;
   }
-  if (!execution_running_.load(std::memory_order_acquire)) {
+  const bool feedback_suppressed =
+    execution_running_.load(std::memory_order_acquire) ||
+    blend_running_.load(std::memory_order_acquire);
+  if (!feedback_suppressed) {
     return feedback_scale_;
   }
   return feedback_scale_ * execution_feedback_scale_;

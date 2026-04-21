@@ -82,22 +82,26 @@ class GravityCompensationWithJointTorqueFeedbackController
   double feedback_max_abs_tau_{30.0};
   bool feedback_additive_{false};
 
-  // While trajectory_executor reports running=true on execution_running_topic, scale
-  // feedback by execution_feedback_scale (0 = off). Ends immediately when running=false.
+  // While trajectory execution or blend-to-leader is active, scale feedback by
+  // execution_feedback_scale (0 = off). Ends immediately when both states are false.
   bool suppress_feedback_during_execution_{true};
   std::string execution_running_topic_{"/execution/running"};
+  std::string blend_running_topic_{"/execution/blend_to_leader_running"};
   double execution_feedback_scale_{0.0};
 
   std::atomic<bool> execution_running_{false};
+  std::atomic<bool> blend_running_{false};
 
   // Realtime transport of tau feedback
   realtime_tools::RealtimeBuffer<Vector7d> tau_feedback_rt_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr tau_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr execution_running_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr blend_running_sub_;
 
   void updateJointStates();
   void onTauArray(const std_msgs::msg::Float64MultiArray& msg);
   void onExecutionRunning(const std_msgs::msg::Bool& msg);
+  void onBlendRunning(const std_msgs::msg::Bool& msg);
   [[nodiscard]] double effectiveFeedbackScale() const;
 };
 
