@@ -26,7 +26,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 "config_path": "/home/user/geo-gp/config/default.yaml",
-                "model_dir": "/home/user/geo-gp/data/02-26/models/6d",
+                "model_dir": "/home/user/geo-gp/data/04-21/models/6d",
                 "input_topic": "/gp_prompt_trajectory",
                 "output_topic": "/gp_predicted_trajectory",
                 "execution_running_topic": "/execution/running",
