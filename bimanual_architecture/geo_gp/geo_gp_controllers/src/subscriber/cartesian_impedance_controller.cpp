@@ -491,6 +491,12 @@ void CartesianImpedanceController::leaderRobotStateCallback(
   if (execution_running_.load(std::memory_order_relaxed)) {
     return;
   }
+  // Once execution has ended, wait for the update loop to initialize blend-to-leader
+  // from the current follower pose. Do not snap desired pose directly to the live
+  // leader pose during this pending window.
+  if (pending_blend_to_leader_.load(std::memory_order_relaxed)) {
+    return;
+  }
   if (blending_to_leader_.load(std::memory_order_relaxed)) {
     return;
   }
