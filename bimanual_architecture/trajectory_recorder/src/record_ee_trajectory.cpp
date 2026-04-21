@@ -46,6 +46,7 @@ public:
     }
 
     RCLCPP_INFO(this->get_logger(), "TF ready. Start recording.");
+    start_time_ = this->now();
 
     timer_ = this->create_wall_timer(
       5ms, std::bind(&EETrajectoryRecorder::record, this));
@@ -57,12 +58,14 @@ private:
       auto tf = tf_buffer_.lookupTransform(
           base_frame_, ee_frame_, tf2::TimePointZero);
 
-      double t = this->now().seconds();
+      double t = (this->now() - start_time_).seconds();
+      std::ostringstream time_stream;
+      time_stream << std::fixed << std::setprecision(2) << t;
 
       auto &p = tf.transform.translation;
       auto &q = tf.transform.rotation;
 
-      file_ << t << ","
+      file_ << time_stream.str() << ","
             << p.x << "," << p.y << "," << p.z << ","
             << q.x << "," << q.y << "," << q.z << "," << q.w
             << "\n";
@@ -74,6 +77,7 @@ private:
 
   std::string base_frame_, ee_frame_;
   std::ofstream file_;
+  rclcpp::Time start_time_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp::TimerBase::SharedPtr timer_;
