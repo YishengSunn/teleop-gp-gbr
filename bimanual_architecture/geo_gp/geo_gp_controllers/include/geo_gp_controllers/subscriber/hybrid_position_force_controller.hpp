@@ -80,7 +80,7 @@ private:
   double blend_running_hold_sec_{0.5};
 
   std::string force_axis_name_{"z"};
-  int force_axis_{1};
+  int force_axis_{2};
 
   double pos_stiff_{100.0};
   double rot_stiff_{10.0};

@@ -11,25 +11,21 @@
 
 namespace {
 
-inline void pseudoInverse(const Eigen::MatrixXd& matrix, Eigen::MatrixXd& matrix_pinv,
-                          bool damped = true) {
+inline void pseudoInverse(const Eigen::MatrixXd& matrix, Eigen::MatrixXd& matrix_pinv, bool damped = true) {
   const double lambda = damped ? 0.2 : 0.0;
 
-  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
-      matrix, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(matrix, Eigen::ComputeFullU | Eigen::ComputeFullV);
   const auto singular_values = svd.singularValues();
   Eigen::MatrixXd singular_value_inv = matrix;
   singular_value_inv.setZero();
 
   for (int i = 0; i < singular_values.size(); ++i) {
     singular_value_inv(i, i) =
-        singular_values(i) /
-        (singular_values(i) * singular_values(i) + lambda * lambda);
+        singular_values(i) / (singular_values(i) * singular_values(i) + lambda * lambda);
   }
 
   matrix_pinv =
-      Eigen::MatrixXd(svd.matrixV() * singular_value_inv.transpose() *
-                      svd.matrixU().transpose());
+      Eigen::MatrixXd(svd.matrixV() * singular_value_inv.transpose() * svd.matrixU().transpose());
 }
 
 inline double clampAbs(double value, double max_abs) {
@@ -73,7 +69,8 @@ HybridPositionForceController::state_interface_configuration() const {
     for (const auto& name : franka_robot_model_->get_state_interface_names()) {
       config.names.push_back(name);
     }
-  } else {
+  }
+  else {
     franka_semantic_components::FrankaRobotModel temp_model(
         arm_id_ + "/robot_model", arm_id_);
     for (const auto& name : temp_model.get_state_interface_names()) {
@@ -93,7 +90,8 @@ controller_interface::return_type HybridPositionForceController::update(
   Quaterniond current_orientation(current_pose.block<3, 3>(0, 0));
   current_orientation.normalize();
 
-  const auto coriolis_array = franka_robot_model_->getCoriolisForceVector();
+  const auto coriolis_array =
+      franka_robot_model_->getCoriolisForceVector();
   Eigen::Map<const Vector7d> coriolis(coriolis_array.data());
   const auto jacobian_array =
       franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
@@ -147,7 +145,8 @@ controller_interface::return_type HybridPositionForceController::update(
   if (pending_blend_to_leader_.load(std::memory_order_acquire)) {
     if (!blend_to_leader_enabled_) {
       pending_blend_to_leader_.store(false, std::memory_order_release);
-    } else {
+    }
+    else {
       const auto* goal = leader_pose_cache_.readFromRT();
       if (goal) {
         pending_blend_to_leader_.store(false, std::memory_order_release);
@@ -178,7 +177,8 @@ controller_interface::return_type HybridPositionForceController::update(
         mode_.store(
             static_cast<uint8_t>(Mode::BLEND_TO_LEADER), std::memory_order_release);
         skip_pose_read_this_cycle = true;
-      } else {
+      }
+      else {
         static int log_ctr = 0;
         if (++log_ctr % 500 == 0) {
           RCLCPP_WARN(
@@ -257,7 +257,8 @@ controller_interface::return_type HybridPositionForceController::update(
       desired_pose_rt_.qz);
   if (desired_orientation.norm() < 1e-9) {
     desired_orientation = Quaterniond::Identity();
-  } else {
+  }
+  else {
     desired_orientation.normalize();
   }
 
@@ -292,7 +293,8 @@ controller_interface::return_type HybridPositionForceController::update(
   if (!force_filter_initialized_) {
     filtered_force_measurement_ = raw_force_measurement;
     force_filter_initialized_ = true;
-  } else {
+  }
+  else {
     filtered_force_measurement_ =
         measured_force_filter_alpha_ * filtered_force_measurement_ +
         (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
@@ -353,8 +355,7 @@ CallbackReturn HybridPositionForceController::on_init() {
     auto_declare<double>("rot_stiff", 10.0);
     auto_declare<double>("n_stiffness", 10.0);
 
-    auto_declare<std::string>(
-        "leader_robot_state_topic", "/leader/franka_robot_state_broadcaster/robot_state");
+    auto_declare<std::string>("leader_robot_state_topic", "/leader/franka_robot_state_broadcaster/robot_state");
     auto_declare<std::string>("execution_pose_topic", "/execution/desired_pose");
     auto_declare<std::string>("desired_force_topic", "/execution/desired_force");
     auto_declare<std::string>("execution_running_topic", "/execution/running");
@@ -367,7 +368,7 @@ CallbackReturn HybridPositionForceController::on_init() {
     auto_declare<double>("blend_duration_max", 8.0);
     auto_declare<double>("blend_running_hold_sec", 0.5);
 
-    auto_declare<std::string>("force_axis", "y");
+    auto_declare<std::string>("force_axis", "z");
     auto_declare<double>("force_kp", 1.0);
     auto_declare<double>("force_ki", 0.0);
     auto_declare<double>("force_damping", 5.0);
@@ -385,7 +386,8 @@ CallbackReturn HybridPositionForceController::on_init() {
         "start_k_gains", {600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0});
     auto_declare<std::vector<double>>(
         "start_d_gains", {30.0, 30.0, 30.0, 30.0, 10.0, 10.0, 5.0});
-  } catch (const std::exception& e) {
+  }
+  catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
   }
@@ -413,13 +415,16 @@ CallbackReturn HybridPositionForceController::on_configure(
   blend_running_topic_ =
       get_node()->get_parameter("blend_running_topic").as_string();
 
-  blend_to_leader_enabled_ = get_node()->get_parameter("blend_to_leader_enabled").as_bool();
+  blend_to_leader_enabled_ =
+      get_node()->get_parameter("blend_to_leader_enabled").as_bool();
   blend_seconds_per_meter_ =
       get_node()->get_parameter("blend_seconds_per_meter").as_double();
   blend_seconds_per_rad_ =
       get_node()->get_parameter("blend_seconds_per_rad").as_double();
-  blend_duration_min_ = get_node()->get_parameter("blend_duration_min").as_double();
-  blend_duration_max_ = get_node()->get_parameter("blend_duration_max").as_double();
+  blend_duration_min_ =
+      get_node()->get_parameter("blend_duration_min").as_double();
+  blend_duration_max_ =
+      get_node()->get_parameter("blend_duration_max").as_double();
   blend_running_hold_sec_ =
       get_node()->get_parameter("blend_running_hold_sec").as_double();
 
@@ -446,7 +451,8 @@ CallbackReturn HybridPositionForceController::on_configure(
   initial_desired_force_ =
       get_node()->get_parameter("initial_desired_force").as_double();
 
-  move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
+  move_to_start_ =
+      get_node()->get_parameter("move_to_start").as_bool();
   const auto start_q =
       get_node()->get_parameter("start_joint_configuration").as_double_array();
   if (start_q.size() != static_cast<size_t>(kNumJoints)) {
@@ -582,7 +588,8 @@ CallbackReturn HybridPositionForceController::on_activate(
     motion_generator_ = std::make_unique<MotionGenerator>(0.2, q, q_start_);
     start_time_ = this->get_node()->now();
     mode_.store(static_cast<uint8_t>(Mode::MOVE_TO_START), std::memory_order_release);
-  } else {
+  }
+  else {
     mode_.store(static_cast<uint8_t>(Mode::HYBRID), std::memory_order_release);
     accept_desired_.store(true, std::memory_order_release);
   }
