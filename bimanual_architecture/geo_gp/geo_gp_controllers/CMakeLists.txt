@@ -28,6 +28,7 @@ add_library(
   SHARED
   src/comless/motion_generator.cpp
   src/subscriber/cartesian_impedance_controller.cpp
+  src/subscriber/hybrid_position_force_controller.cpp
   src/subscriber/joint_impedance_controller.cpp
   src/subscriber/gravity_compensation_with_joint_torque_feedback_controller.cpp
 )

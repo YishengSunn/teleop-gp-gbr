@@ -205,6 +205,18 @@ def generate_launch_description():
                 ]),
             ),
         ),
+        Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=['hybrid_position_force_controller', '--controller-manager', cm_abs],
+            namespace=ns,
+            output='screen',
+            condition=IfCondition(
+                PythonExpression([
+                "'", ns, "' == 'follower' and '", move_to_start, "' == 'false' and '", control_mode, "' == 'hybrid_position_force'"
+                ]),
+            ),
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([PathJoinSubstitution(
                 [FindPackageShare('franka_gripper'), 'launch', 'gripper.launch.py'])]),
