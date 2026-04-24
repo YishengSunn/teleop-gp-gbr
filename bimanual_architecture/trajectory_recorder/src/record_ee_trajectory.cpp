@@ -1,8 +1,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <franka_msgs/msg/franka_state.hpp>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
 
+#include <array>
 #include <fstream>
 #include <chrono>
 #include <iomanip>
@@ -32,10 +34,17 @@ public:
   {
     base_frame_ = "leader_link0";
     ee_frame_   = "leader_link8";
+    robot_state_topic_ = "/leader/franka_robot_state_broadcaster/robot_state";
 
     std::string filename = "ee_trajectory_" + getTimeStamp() + ".csv";
     file_.open(filename);
-    file_ << "time,x,y,z,qx,qy,qz,qw\n";
+    file_ << "time,x,y,z,qx,qy,qz,qw,fx,fy,fz\n";
+
+    const auto latest_only_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    robot_state_sub_ = this->create_subscription<franka_msgs::msg::FrankaState>(
+      robot_state_topic_,
+      latest_only_qos,
+      std::bind(&EETrajectoryRecorder::robotStateCallback, this, std::placeholders::_1));
 
     RCLCPP_INFO(this->get_logger(), "Waiting for TF tree...");
 
@@ -53,6 +62,14 @@ public:
   }
 
 private:
+  void robotStateCallback(const franka_msgs::msg::FrankaState::SharedPtr msg) {
+    latest_force_ = {
+      msg->o_f_ext_hat_k[0],
+      msg->o_f_ext_hat_k[1],
+      msg->o_f_ext_hat_k[2],
+    };
+  }
+
   void record() {
     try {
       auto tf = tf_buffer_.lookupTransform(
@@ -67,7 +84,8 @@ private:
 
       file_ << time_stream.str() << ","
             << p.x << "," << p.y << "," << p.z << ","
-            << q.x << "," << q.y << "," << q.z << "," << q.w
+            << q.x << "," << q.y << "," << q.z << "," << q.w << ","
+            << latest_force_[0] << "," << latest_force_[1] << "," << latest_force_[2]
             << "\n";
     }
     catch (tf2::TransformException &ex) {
@@ -75,11 +93,13 @@ private:
     }
   }
 
-  std::string base_frame_, ee_frame_;
+  std::string base_frame_, ee_frame_, robot_state_topic_;
+  std::array<double, 3> latest_force_{0.0, 0.0, 0.0};
   std::ofstream file_;
   rclcpp::Time start_time_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
+  rclcpp::Subscription<franka_msgs::msg::FrankaState>::SharedPtr robot_state_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

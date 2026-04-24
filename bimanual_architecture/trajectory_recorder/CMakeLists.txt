@@ -10,10 +10,11 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(franka_msgs REQUIRED)
 
 add_executable(record_ee_trajectory src/record_ee_trajectory.cpp)
 
-ament_target_dependencies(record_ee_trajectory rclcpp tf2_ros geometry_msgs)
+ament_target_dependencies(record_ee_trajectory rclcpp tf2_ros geometry_msgs franka_msgs)
 
 install(TARGETS
   record_ee_trajectory
