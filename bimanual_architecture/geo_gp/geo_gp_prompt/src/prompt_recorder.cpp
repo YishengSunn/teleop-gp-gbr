@@ -73,6 +73,9 @@ void PromptRecorder::execution_running_callback(
         reset_recording_state();
         RCLCPP_INFO(this->get_logger(), "Execution START");
     }
+    if (!msg->data && execution_running_) {
+        request_rearm();
+    }
     execution_running_ = msg->data;
 }
 
@@ -80,6 +83,9 @@ void PromptRecorder::blend_running_callback(
     const std_msgs::msg::Bool::SharedPtr msg) {
     if (msg->data && !blend_running_) {
         reset_recording_state();
+    }
+    if (!msg->data && blend_running_) {
+        request_rearm();
     }
     if (msg->data != blend_running_) {
         RCLCPP_INFO(
@@ -101,6 +107,9 @@ void PromptRecorder::enabled_callback(
 
     if (!enabled_) {
         reset_recording_state();
+    }
+    else {
+        request_rearm();
     }
 
     RCLCPP_INFO(
@@ -130,6 +139,24 @@ void PromptRecorder::pose_callback(
         dq_norm += v * v;
     }
     dq_norm = std::sqrt(dq_norm);
+
+    if (waiting_for_settle_) {
+        if (dq_norm < stop_threshold_) {
+            settle_counter_++;
+        }
+        else {
+            settle_counter_ = 0;
+        }
+
+        if (settle_counter_ > stop_count_threshold_) {
+            waiting_for_settle_ = false;
+            settle_counter_ = 0;
+            RCLCPP_INFO(this->get_logger(), "Prompt recorder re-armed after pause");
+        }
+        else {
+            return;
+        }
+    }
 
     // 2. Extract end-effector pose
     Eigen::Map<const Eigen::Matrix4d> T(msg->o_t_ee.data());
@@ -223,7 +250,13 @@ void PromptRecorder::reset_recording_state() {
     time_from_start_.clear();
     moving_counter_ = 0;
     stop_counter_ = 0;
+    settle_counter_ = 0;
     state_ = State::IDLE;
+}
+
+void PromptRecorder::request_rearm() {
+    reset_recording_state();
+    waiting_for_settle_ = true;
 }
 
 bool PromptRecorder::publish_paused() const {

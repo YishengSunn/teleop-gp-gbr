@@ -22,6 +22,7 @@ private:
     void blend_running_callback(const std_msgs::msg::Bool::SharedPtr msg);
     void enabled_callback(const std_msgs::msg::Bool::SharedPtr msg);
     void reset_recording_state();
+    void request_rearm();
     bool publish_paused() const;
     bool can_publish_online() const;
     void publish_prompt();
@@ -50,6 +51,7 @@ private:
 
     int moving_counter_ = 0;
     int stop_counter_ = 0;
+    int settle_counter_ = 0;
 
     int moving_count_threshold_;
     int stop_count_threshold_;
@@ -61,6 +63,7 @@ private:
     int publish_period_ms_ = 150;
     size_t publish_min_points_ = 10;
     rclcpp::Time last_online_publish_time_;
+    bool waiting_for_settle_ = false;
 
     // State machine
     enum class State {
