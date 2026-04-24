@@ -26,6 +26,19 @@ inline void pseudoInverse(const Eigen::MatrixXd& M_, Eigen::MatrixXd& M_pinv_, b
 
 namespace geo_gp_controllers {
 
+namespace {
+Quaterniond slerpShortestArc(const Quaterniond& q0_in, const Quaterniond& q1_in, double s) {
+  Quaterniond q0 = q0_in.normalized();
+  Quaterniond q1 = q1_in.normalized();
+
+  if (q0.dot(q1) < 0.0) {
+    q1.coeffs() *= -1.0;
+  }
+
+  return q0.slerp(s, q1).normalized();
+}
+}  // namespace
+
 controller_interface::InterfaceConfiguration
 CartesianImpedanceController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
@@ -134,7 +147,11 @@ CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
         const Vector3d p1(blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
         const double pos_dist = (p1 - p0).norm();
         const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
-        const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        if (q0.dot(q1) < 0.0) {
+          q1.coeffs() *= -1.0;
+          desiredPoseFromQuaternion(q1, &blend_pose_goal_);
+        }
         const double ang_dist = q0.angularDistance(q1);
 
         blend_duration_sec_ =
@@ -169,7 +186,7 @@ CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
 
     const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
     const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
-    const Quaterniond q_interp = q0.slerp(s, q1);
+    const Quaterniond q_interp = slerpShortestArc(q0, q1, s);
 
     desired_pose_rt_.px = p.x();
     desired_pose_rt_.py = p.y();
@@ -507,7 +524,13 @@ void CartesianImpedanceController::executionDesiredPoseCallback(
   if (!accept_desired_.load(std::memory_order_relaxed)) {
     return;
   }
-
+  if (!execution_running_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (pending_blend_to_leader_.load(std::memory_order_acquire) ||
+      blending_to_leader_.load(std::memory_order_acquire)) {
+    return;
+  }
   if (msg.data.size() < 7) {
     return;
   }
@@ -550,10 +573,10 @@ void CartesianImpedanceController::executionRunningCallback(
   const bool now = msg->data;
   const bool prev = prev_execution_running_;
   prev_execution_running_ = now;
-  execution_running_.store(now, std::memory_order_release);
   if (prev && !now) {
     pending_blend_to_leader_.store(true, std::memory_order_release);
   }
+  execution_running_.store(now, std::memory_order_release);
 }
 
 Quaterniond CartesianImpedanceController::quatFromDesiredPose(const DesiredPoseRT& p) {

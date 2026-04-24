@@ -45,6 +45,15 @@ inline double clampRange(double value, double min_value, double max_value) {
   return std::max(min_value, std::min(max_value, value));
 }
 
+Quaterniond slerpShortestArc(const Quaterniond& q0_in, const Quaterniond& q1_in, double s) {
+  Quaterniond q0 = q0_in.normalized();
+  Quaterniond q1 = q1_in.normalized();
+  if (q0.dot(q1) < 0.0) {
+    q1.coeffs() *= -1.0;
+  }
+  return q0.slerp(s, q1).normalized();
+}
+
 }  // namespace
 
 namespace geo_gp_controllers {
@@ -164,7 +173,11 @@ controller_interface::return_type HybridPositionForceController::update(
             blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
         const double pos_dist = (p1 - p0).norm();
         const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
-        const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        if (q0.dot(q1) < 0.0) {
+          q1.coeffs() *= -1.0;
+          desiredPoseFromQuaternion(q1, &blend_pose_goal_);
+        }
         const double ang_dist = q0.angularDistance(q1);
 
         blend_duration_sec_ =
@@ -203,7 +216,7 @@ controller_interface::return_type HybridPositionForceController::update(
 
     const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
     const Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
-    const Quaterniond q_interp = q0.slerp(s, q1);
+    const Quaterniond q_interp = slerpShortestArc(q0, q1, s);
 
     desired_pose_rt_.px = p.x();
     desired_pose_rt_.py = p.y();
@@ -654,6 +667,13 @@ void HybridPositionForceController::executionDesiredPoseCallback(
   if (!accept_desired_.load(std::memory_order_relaxed)) {
     return;
   }
+  if (!execution_running_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (pending_blend_to_leader_.load(std::memory_order_acquire) ||
+      blending_to_leader_.load(std::memory_order_acquire)) {
+    return;
+  }
   if (msg.data.size() < 7) {
     return;
   }
@@ -709,10 +729,10 @@ void HybridPositionForceController::executionRunningCallback(
   const bool now = msg->data;
   const bool prev = prev_execution_running_;
   prev_execution_running_ = now;
-  execution_running_.store(now, std::memory_order_release);
   if (prev && !now) {
     pending_blend_to_leader_.store(true, std::memory_order_release);
   }
+  execution_running_.store(now, std::memory_order_release);
 }
 
 bool HybridPositionForceController::forceAxisFromString(
