@@ -45,9 +45,10 @@ inline double clampRange(double value, double min_value, double max_value) {
   return std::max(min_value, std::min(max_value, value));
 }
 
-Quaterniond slerpShortestArc(const Quaterniond& q0_in, const Quaterniond& q1_in, double s) {
-  Quaterniond q0 = q0_in.normalized();
-  Quaterniond q1 = q1_in.normalized();
+Eigen::Quaterniond slerpShortestArc(
+    const Eigen::Quaterniond& q0_in, const Eigen::Quaterniond& q1_in, double s) {
+  Eigen::Quaterniond q0 = q0_in.normalized();
+  Eigen::Quaterniond q1 = q1_in.normalized();
   if (q0.dot(q1) < 0.0) {
     q1.coeffs() *= -1.0;
   }
