@@ -77,7 +77,7 @@ private:
 
       double t = (this->now() - start_time_).seconds();
       std::ostringstream time_stream;
-      time_stream << std::fixed << std::setprecision(2) << t;
+      time_stream << std::fixed << std::setprecision(4) << t;
 
       auto &p = tf.transform.translation;
       auto &q = tf.transform.rotation;
