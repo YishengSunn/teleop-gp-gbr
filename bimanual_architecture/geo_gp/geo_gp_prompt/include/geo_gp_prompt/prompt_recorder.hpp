@@ -7,6 +7,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 #include <franka_msgs/msg/franka_state.hpp>
 #include <geo_gp_interfaces/msg/prompt_trajectory.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -36,6 +37,7 @@ private:
 
     // Data
     std::vector<geometry_msgs::msg::Pose> poses_;
+    std::vector<geometry_msgs::msg::Vector3> forces_;
     std::vector<double> time_from_start_;
     rclcpp::Time motion_start_time_;
 

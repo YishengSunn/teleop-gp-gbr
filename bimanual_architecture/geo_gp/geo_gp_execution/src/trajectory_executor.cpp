@@ -20,6 +20,10 @@ TrajectoryExecutor::TrajectoryExecutor()
         "input_topic", "/gp_predicted_trajectory");
     output_topic_ = this->declare_parameter<std::string>(
         "output_topic", "/execution/desired_pose");
+    force_output_topic_ = this->declare_parameter<std::string>(
+        "force_output_topic", "/execution/desired_force");
+    force_axis_ = this->declare_parameter<std::string>(
+        "force_axis", "z");
     running_topic_ = this->declare_parameter<std::string>(
         "running_topic", "/execution/running");
     publish_rate_ = this->declare_parameter<double>(
@@ -32,6 +36,10 @@ TrajectoryExecutor::TrajectoryExecutor()
 
     pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         output_topic_, 10
+    );
+
+    force_pub_ = this->create_publisher<std_msgs::msg::Float64>(
+        force_output_topic_, 10
     );
 
     pub_running_ = this->create_publisher<std_msgs::msg::Bool>(
@@ -64,6 +72,17 @@ void TrajectoryExecutor::trajectory_callback(
     }
 
     trajectory_ = msg->poses;
+    if (msg->forces.size() == msg->poses.size()) {
+        force_trajectory_ = msg->forces;
+    }
+    else {
+        force_trajectory_.clear();
+        if (!msg->forces.empty()) {
+            RCLCPP_WARN(this->get_logger(),
+                "PredictedTrajectory.forces size mismatch, skip force execution. poses=%zu forces=%zu",
+                msg->poses.size(), msg->forces.size());
+        }
+    }
     trajectory_time_ = msg->time_from_start;
 
     if (trajectory_time_.size() != trajectory_.size()) {
@@ -101,6 +120,9 @@ void TrajectoryExecutor::timer_callback() {
 
     if (elapsed >= trajectory_time_.back()) {
         publish_pose(trajectory_.back());
+        if (!force_trajectory_.empty()) {
+            publish_force(force_trajectory_.back());
+        }
         executing_ = false;
         publish_running(pub_running_, false);
         RCLCPP_INFO(this->get_logger(),
@@ -110,6 +132,9 @@ void TrajectoryExecutor::timer_callback() {
     }
 
     publish_pose(trajectory_[index_]);
+    if (!force_trajectory_.empty() && index_ < force_trajectory_.size()) {
+        publish_force(force_trajectory_[index_]);
+    }
 
     if (index_ + 1 < trajectory_.size() &&
         trajectory_time_[index_ + 1] <= elapsed) {
@@ -129,6 +154,22 @@ void TrajectoryExecutor::publish_pose(const geometry_msgs::msg::Pose & pose) {
         pose.orientation.w
     };
     pub_->publish(msg);
+}
+
+void TrajectoryExecutor::publish_force(const geometry_msgs::msg::Vector3 & force) {
+    std_msgs::msg::Float64 msg;
+    msg.data = select_force_axis(force);
+    force_pub_->publish(msg);
+}
+
+double TrajectoryExecutor::select_force_axis(const geometry_msgs::msg::Vector3 & force) const {
+    if (force_axis_ == "x" || force_axis_ == "X") {
+        return force.x;
+    }
+    if (force_axis_ == "y" || force_axis_ == "Y") {
+        return force.y;
+    }
+    return force.z;
 }
 
 int main(int argc, char ** argv) {

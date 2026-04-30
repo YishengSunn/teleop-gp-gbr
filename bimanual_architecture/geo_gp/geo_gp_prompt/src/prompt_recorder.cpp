@@ -175,6 +175,11 @@ void PromptRecorder::pose_callback(
     pose.orientation.z = q.z();
     pose.orientation.w = q.w();
 
+    geometry_msgs::msg::Vector3 force;
+    force.x = msg->o_f_ext_hat_k[0];
+    force.y = msg->o_f_ext_hat_k[1];
+    force.z = msg->o_f_ext_hat_k[2];
+
     // 3. State machine
     switch (state_) {
         case State::IDLE: {
@@ -183,10 +188,12 @@ void PromptRecorder::pose_callback(
 
             if (moving_counter_ > moving_count_threshold_) {
                 poses_.clear();
+                forces_.clear();
                 time_from_start_.clear();
                 motion_start_time_ = now;
                 last_online_publish_time_ = now;
                 poses_.push_back(pose);
+                forces_.push_back(force);
                 time_from_start_.push_back(0.0);
 
                 state_ = State::MOVING;
@@ -199,6 +206,7 @@ void PromptRecorder::pose_callback(
 
         case State::MOVING: {
             poses_.push_back(pose);
+            forces_.push_back(force);
             time_from_start_.push_back((now - motion_start_time_).seconds());
 
             if (online_mode_ && can_publish_online()) {
@@ -238,6 +246,7 @@ void PromptRecorder::pose_callback(
             }
 
             poses_.clear();
+            forces_.clear();
             time_from_start_.clear();
             state_ = State::IDLE;
             break;
@@ -247,6 +256,7 @@ void PromptRecorder::pose_callback(
 
 void PromptRecorder::reset_recording_state() {
     poses_.clear();
+    forces_.clear();
     time_from_start_.clear();
     moving_counter_ = 0;
     stop_counter_ = 0;
@@ -281,14 +291,16 @@ void PromptRecorder::publish_prompt() {
     geo_gp_interfaces::msg::PromptTrajectory msg;
     msg.header.frame_id = "world";
     msg.poses = poses_;
+    msg.forces = forces_;
     msg.time_from_start = time_from_start_;
 
     prompt_pub_->publish(msg);
 
     RCLCPP_INFO(this->get_logger(),
-        "Published %s prompt trajectory with %zu poses.",
+        "Published %s prompt trajectory with %zu poses and %zu force samples.",
         online_mode_ ? "online-prefix" : "final-trajectory",
-        msg.poses.size());
+        msg.poses.size(),
+        msg.forces.size());
 }
 
 int main(int argc, char ** argv) {

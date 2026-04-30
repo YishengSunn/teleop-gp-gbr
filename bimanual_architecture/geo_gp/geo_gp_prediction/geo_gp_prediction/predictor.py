@@ -4,7 +4,7 @@ import time
 import torch
 import numpy as np
 from geo_gp_interfaces.msg import PromptTrajectory, PredictedTrajectory
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Vector3
 
 os.environ["DISPLAY"] = ""
 sys.path.append("/home/user/geo-gp")
@@ -82,7 +82,7 @@ class Predictor:
         Returns:
             float: The estimated speed of the prompt trajectory.
         """
-        prompt_pts, _ = self.prompt_to_numpy(prompt_msg)
+        prompt_pts, _, _ = self.prompt_to_numpy(prompt_msg)
 
         if prompt_pts.shape[0] < 2:
             return self.default_speed
@@ -104,11 +104,13 @@ class Predictor:
             msg (PromptTrajectory): The input ROS PromptTrajectory message.
 
         Returns:
-            tuple[np.ndarray, np.ndarray]:
-                positions array of shape (N, 3) and quaternions array of shape (N, 4) in [w, x, y, z].
+            tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+                positions array of shape (N, 3), quaternions array of shape (N, 4)
+                in [w, x, y, z], and optional force array of shape (N, 3).
         """
         pts = []
         quats = []
+        forces = []
 
         for p in msg.poses:
             pts.append([
@@ -123,13 +125,19 @@ class Predictor:
                 p.orientation.z,
             ])
 
-        return np.array(pts), np.array(quats)
+        if len(msg.forces) == len(msg.poses):
+            for f in msg.forces:
+                forces.append([f.x, f.y, f.z])
+
+        force_arr = np.array(forces) if forces else None
+        return np.array(pts), np.array(quats), force_arr
 
     def numpy_to_predicted(
         self,
         ref_msg: PromptTrajectory,
         pts: np.ndarray,
         quats: np.ndarray = None,
+        forces: np.ndarray = None,
         *,
         target_speed=None,
         skill_name="",
@@ -177,6 +185,12 @@ class Predictor:
                 pose.orientation = ref_msg.poses[-1].orientation
 
             out.poses.append(pose)
+            if forces is not None and i < len(forces):
+                force = Vector3()
+                force.x = float(forces[i][0])
+                force.y = float(forces[i][1])
+                force.z = float(forces[i][2])
+                out.forces.append(force)
 
         if target_speed is None:
             target_speed = self.default_speed
@@ -194,7 +208,7 @@ class Predictor:
 
         return out
 
-    def predict(self, prompt_msg: PromptTrajectory):
+    def predict(self, prompt_msg: PromptTrajectory, predict_force: bool = True):
         """
         Predict the trajectory based on the prompt path.
 
@@ -212,13 +226,24 @@ class Predictor:
         self.logger.info(f"Target execution speed from prompt: {target_speed:.4f} m/s")
 
         # 1) ROS Path → numpy
-        probe, probe_quat = self.prompt_to_numpy(prompt_msg)
+        probe, probe_quat, probe_force = self.prompt_to_numpy(prompt_msg)
+        if not predict_force:
+            probe_force = None
 
-        probe_eq, probe_quat_eq = resample_trajectory_6d_equal_dt(
-            probe,
-            probe_quat,
-            sample_hz=self.sample_hz,
-            speed=self.default_speed)
+        if probe_force is not None:
+            probe_eq, probe_quat_eq, probe_force_eq = resample_trajectory_6d_equal_dt(
+                probe,
+                probe_quat,
+                sample_hz=self.sample_hz,
+                speed=self.default_speed,
+                points_force=probe_force)
+        else:
+            probe_eq, probe_quat_eq = resample_trajectory_6d_equal_dt(
+                probe,
+                probe_quat,
+                sample_hz=self.sample_hz,
+                speed=self.default_speed)
+            probe_force_eq = None
 
         if len(probe_eq) < (self.k + 2):
             self.logger.info("[Predict] Not enough probe points")
@@ -226,6 +251,7 @@ class Predictor:
                 prompt_msg,
                 probe,
                 probe_quat,
+                probe_force,
                 target_speed=target_speed,
                 skill_name="",
                 success=False,
@@ -234,6 +260,8 @@ class Predictor:
 
         probe_eq = moving_average_centered_pos(probe_eq, self.smooth_win)
         probe_quat_eq = moving_average_centered_6d(probe_quat_eq, self.smooth_win)
+        if probe_force_eq is not None:
+            probe_force_eq = moving_average_centered_6d(probe_force_eq, self.smooth_win)
 
         # 2) Skill matching
         t_match_start = time.perf_counter()
@@ -253,19 +281,23 @@ class Predictor:
         t_rollout_start = time.perf_counter()
         preds = None
         preds_quat = None
+        preds_force = None
 
         for attempt in range(self.max_retries):
             cur_pos = probe_in_ref.copy()
             cur_quat = probe_quat_eq.copy()[:cur_pos.shape[0]]
+            cur_force = None if probe_force_eq is None else probe_force_eq.copy()[:cur_pos.shape[0]]
             preds_world_pos = []
             preds_world_quat = []
+            preds_world_force = []
             failed = False
 
             for step in range(self.rollout_horizon):
                 tp = torch.tensor(cur_pos, dtype=torch.float32)
                 tq = torch.tensor(cur_quat, dtype=torch.float32)
+                tf = None if cur_force is None else torch.tensor(cur_force, dtype=torch.float32)
 
-                preds_ref_pos, preds_quat, _, _, _, _, vars_ref = rollout_reference_6d(
+                preds_ref_pos, preds_quat, preds_ref_force, _, _, _, vars_ref = rollout_reference_6d(
                     model,
                     tp,
                     tq,
@@ -275,7 +307,7 @@ class Predictor:
                     input_type=input_type,
                     output_type=output_type,
                     R_ref_probe=R,
-                    traj_force=None,
+                    traj_force=tf,
                 )
 
                 next_ref_pos = preds_ref_pos[-1].numpy()
@@ -286,9 +318,14 @@ class Predictor:
 
                 preds_world_pos.append(next_world_pos)
                 preds_world_quat.append(next_world_quat)
+                if preds_ref_force is not None:
+                    next_world_force = preds_ref_force[-1].numpy()
+                    preds_world_force.append(next_world_force)
 
                 cur_pos = np.vstack([cur_pos, next_ref_pos])
                 cur_quat = np.vstack([cur_quat, next_world_quat[None, :]])
+                if cur_force is not None and preds_ref_force is not None:
+                    cur_force = np.vstack([cur_force, next_world_force[None, :]])
 
                 # Truncation
                 d = np.linalg.norm(next_world_pos - probe_goal)
@@ -309,6 +346,9 @@ class Predictor:
             if not failed:
                 preds_world_pos = np.asarray(preds_world_pos)
                 preds_world_quat = np.asarray(preds_world_quat)
+                preds_world_force = (
+                    np.asarray(preds_world_force) if len(preds_world_force) else None
+                )
 
                 probe_end = probe_eq[-1]
                 dists = np.linalg.norm(preds_world_pos - probe_end, axis=1)
@@ -323,6 +363,9 @@ class Predictor:
                     i_start = int(candidate_idxs[0])
                     preds = preds_world_pos[i_start:]
                     preds_quat = preds_world_quat[i_start:]
+                    preds_force = (
+                        preds_world_force[i_start:] if preds_world_force is not None else None
+                    )
                     break
 
             # Drop tail
@@ -340,6 +383,7 @@ class Predictor:
                 prompt_msg,
                 probe_eq,
                 probe_quat_eq,
+                probe_force_eq,
                 target_speed=target_speed,
                 skill_name=skill.name,
                 success=False,
@@ -356,10 +400,13 @@ class Predictor:
             blend_first_step_pos=0.5,
             blend_first_step_rot=0.5,
         )
+        if preds_force is not None:
+            preds_force = moving_average_centered_6d(preds_force, self.smooth_win)
 
         rollout_ms = (time.perf_counter() - t_rollout_start) * 1000.0
         total_ms = (time.perf_counter() - t_predict_start) * 1000.0
-        self.logger.info(f"[Predict] Done. preds={preds.shape}")
+        preds_force_shape = preds_force.shape if preds_force is not None else None
+        self.logger.info(f"[Predict] Done. preds={preds.shape}, preds_force={preds_force_shape}")
         self.logger.info(
             f"[Timing] matching={match_ms:.2f} ms | rollout={rollout_ms:.2f} ms | total={total_ms:.2f} ms"
         )
@@ -369,6 +416,7 @@ class Predictor:
             prompt_msg,
             preds,
             preds_quat,
+            preds_force,
             target_speed=target_speed,
             skill_name=skill.name,
             success=True,

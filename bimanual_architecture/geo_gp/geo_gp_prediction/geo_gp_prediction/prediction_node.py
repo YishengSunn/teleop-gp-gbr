@@ -17,6 +17,7 @@ class PredictionNode(Node):
         self.declare_parameter("output_topic", "/gp_predicted_trajectory")
         self.declare_parameter("execution_running_topic", "/execution/running")
         self.declare_parameter("enabled_topic", "/geo_gp/enabled")
+        self.declare_parameter("force_enabled_topic", "/geo_gp/force_prediction_enabled")
 
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value
@@ -27,6 +28,9 @@ class PredictionNode(Node):
         ).get_parameter_value().string_value
         enabled_topic = self.get_parameter(
             "enabled_topic"
+        ).get_parameter_value().string_value
+        force_enabled_topic = self.get_parameter(
+            "force_enabled_topic"
         ).get_parameter_value().string_value
         self.predictor = Predictor(self.get_logger(), config_path, model_dir)
         self.qos_profile = QoSProfile(
@@ -49,6 +53,7 @@ class PredictionNode(Node):
         self._last_published_seq = 0
         self._execution_running = False
         self._enabled = False
+        self._force_enabled = False
 
         # Subscriber
         self.prompt_sub = self.create_subscription(
@@ -69,6 +74,12 @@ class PredictionNode(Node):
             self.enabled_callback,
             self.state_qos,
         )
+        self.force_enabled_sub = self.create_subscription(
+            Bool,
+            force_enabled_topic,
+            self.force_enabled_callback,
+            self.state_qos,
+        )
 
         # Publisher
         self.pred_pub = self.create_publisher(
@@ -81,7 +92,8 @@ class PredictionNode(Node):
 
         self.get_logger().info(
             "Geo GP Prediction Node Started | "
-            f"input={input_topic} | output={output_topic} | enabled_topic={enabled_topic}"
+            f"input={input_topic} | output={output_topic} | enabled_topic={enabled_topic} | "
+            f"force_enabled_topic={force_enabled_topic}"
         )
 
     def prompt_callback(self, msg: PromptTrajectory):
@@ -118,6 +130,14 @@ class PredictionNode(Node):
 
         self.get_logger().info(f"Geo-GP prediction {'ENABLED' if msg.data else 'DISABLED'}")
 
+    def force_enabled_callback(self, msg: Bool):
+        with self._lock:
+            self._force_enabled = msg.data
+
+        self.get_logger().info(
+            f"Geo-GP force prediction {'ENABLED' if msg.data else 'DISABLED'}"
+        )
+
     def _prediction_worker(self):
         while True:
             self._wake_event.wait()
@@ -141,12 +161,14 @@ class PredictionNode(Node):
 
                     self._worker_busy = True
                     seq, msg = self._latest_prompt
+                    force_enabled = self._force_enabled
                     self._latest_prompt = None
 
                 self.get_logger().info(
-                    f"Starting prediction for latest prompt seq={seq} with {len(msg.poses)} poses"
+                    f"Starting prediction for latest prompt seq={seq} with {len(msg.poses)} poses "
+                    f"and force_enabled={force_enabled}"
                 )
-                pred = self.predictor.predict(msg)
+                pred = self.predictor.predict(msg, predict_force=force_enabled)
                 with self._lock:
                     enabled = self._enabled
                     execution_running = self._execution_running

@@ -7,9 +7,10 @@ The key goal is to use short human prompt motions to trigger GP-based trajectory
 
 1. `prompt_recorder` listens to follower EE state and publishes `PromptTrajectory` on `/gp_prompt_trajectory`.
 2. `prediction_node` loads GP skills (6D models) and predicts `PredictedTrajectory` on `/gp_predicted_trajectory`.
-3. `trajectory_executor` converts predicted trajectory into `/execution/desired_pose` and publishes `/execution/running`.
-4. `cartesian_impedance_controller` tracks execution pose and can blend back to leader after execution.
-5. `geo_gp_toggle` publishes `/geo_gp/enabled` so Geo-GP can be enabled or disabled at runtime.
+3. `prediction_node` can also use prompt force samples to predict future force.
+4. `trajectory_executor` converts predicted trajectory into `/execution/desired_pose`, predicted z-force into `/execution/desired_force`, and publishes `/execution/running`.
+5. `hybrid_position_force_controller` tracks predicted xy pose while executing z-direction force.
+6. `geo_gp_toggle` publishes `/geo_gp/enabled` and `/geo_gp/force_prediction_enabled` so Geo-GP and force prediction can be enabled or disabled at runtime.
 6. During execution/blend, `prompt_recorder` is gated by state topics to avoid self-triggered re-recording loops.
 
 ## Main Packages
@@ -49,6 +50,7 @@ ros2 run geo_gp_prediction geo_gp_toggle
 Controls:
 
 - `g` then Enter: toggle Geo-GP enabled/disabled
+- `f` then Enter: toggle force prediction enabled/disabled
 - `q` then Enter: quit the toggle node
 
 You can also publish the state manually:

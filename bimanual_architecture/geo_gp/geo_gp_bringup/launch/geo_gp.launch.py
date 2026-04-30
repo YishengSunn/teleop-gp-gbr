@@ -31,6 +31,7 @@ def generate_launch_description():
                 "output_topic": "/gp_predicted_trajectory",
                 "execution_running_topic": "/execution/running",
                 "enabled_topic": "/geo_gp/enabled",
+                "force_enabled_topic": "/geo_gp/force_prediction_enabled",
             }]
         ),
         Node(
@@ -41,6 +42,8 @@ def generate_launch_description():
             parameters=[{
                 "input_topic": "/gp_predicted_trajectory",
                 "output_topic": "/execution/desired_pose",
+                "force_output_topic": "/execution/desired_force",
+                "force_axis": "z",
                 "running_topic": "/execution/running",
             }]
         )
