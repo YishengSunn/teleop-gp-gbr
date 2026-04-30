@@ -58,7 +58,7 @@ public:
     start_time_ = this->now();
 
     timer_ = this->create_wall_timer(
-      5ms, std::bind(&EETrajectoryRecorder::record, this));
+      20ms, std::bind(&EETrajectoryRecorder::record, this));
   }
 
 private:
