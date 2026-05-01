@@ -150,6 +150,8 @@ class Predictor:
         Args:
             ref_msg (PromptTrajectory): The reference PromptTrajectory message to copy the header from.
             pts (np.ndarray): A numpy array of shape (N, 3) containing the (x, y, z) coordinates of the predicted trajectory.
+            quats (np.ndarray): A numpy array of shape (N, 4) containing the quaternions of the predicted trajectory.
+            forces (np.ndarray): A numpy array of shape (N, 3) containing the forces of the predicted trajectory.
             target_speed (float): The target speed of the predicted trajectory.
             skill_name (str): The name of the skill used to generate the predicted trajectory.
             success (bool): Whether the prediction was successful.
@@ -287,53 +289,52 @@ class Predictor:
             cur_pos = probe_in_ref.copy()
             cur_quat = probe_quat_eq.copy()[:cur_pos.shape[0]]
             cur_force = None if probe_force_eq is None else probe_force_eq.copy()[:cur_pos.shape[0]]
-            preds_world_pos = []
-            preds_world_quat = []
-            preds_world_force = []
             failed = False
 
-            for step in range(self.rollout_horizon):
-                tp = torch.tensor(cur_pos, dtype=torch.float32)
-                tq = torch.tensor(cur_quat, dtype=torch.float32)
-                tf = None if cur_force is None else torch.tensor(cur_force, dtype=torch.float32)
+            tp = torch.tensor(cur_pos, dtype=torch.float32)
+            tq = torch.tensor(cur_quat, dtype=torch.float32)
+            tf = None if cur_force is None else torch.tensor(cur_force, dtype=torch.float32)
 
-                preds_ref_pos, preds_quat, preds_ref_force, _, _, _, vars_ref = rollout_reference_6d(
-                    model,
-                    tp,
-                    tq,
-                    start_t=cur_pos.shape[0] - 1,
-                    h=1,
-                    k=self.k,
-                    input_type=input_type,
-                    output_type=output_type,
-                    R_ref_probe=R,
-                    traj_force=tf,
-                )
+            preds_ref_pos, preds_quat, preds_ref_force, _, _, _, vars_ref = rollout_reference_6d(
+                model,
+                tp,
+                tq,
+                start_t=cur_pos.shape[0] - 1,
+                h=self.rollout_horizon,
+                k=self.k,
+                input_type=input_type,
+                output_type=output_type,
+                R_ref_probe=R,
+                traj_force=tf,
+            )
 
-                next_ref_pos = preds_ref_pos[-1].numpy()
+            preds_ref_pos_np = preds_ref_pos.numpy()
+            preds_world_pos = s * (preds_ref_pos_np @ R.T) + t
+            preds_world_quat = preds_quat.numpy()
+            preds_world_force = None
+            if preds_ref_force is not None:
+                preds_world_force = preds_ref_force.numpy()
 
-                # Ref → Probe frame
-                next_world_pos = s * (next_ref_pos @ R.T) + t
-                next_world_quat = preds_quat[-1].numpy()
-
-                preds_world_pos.append(next_world_pos)
-                preds_world_quat.append(next_world_quat)
-                if preds_ref_force is not None:
-                    next_world_force = preds_ref_force[-1].numpy()
-                    preds_world_force.append(next_world_force)
-
-                cur_pos = np.vstack([cur_pos, next_ref_pos])
-                cur_quat = np.vstack([cur_quat, next_world_quat[None, :]])
-                if cur_force is not None and preds_ref_force is not None:
-                    cur_force = np.vstack([cur_force, next_world_force[None, :]])
-
-                # Truncation
-                d = np.linalg.norm(next_world_pos - probe_goal)
-                if d < self.goal_stop_eps and np.max(vars_ref) > 1e-3:
+            # Truncation logic
+            if preds_world_pos.shape[0] > 0:
+                dists_goal = np.linalg.norm(preds_world_pos - probe_goal, axis=1)
+                vars_ref_arr = np.asarray(vars_ref)
+                step_unc = vars_ref_arr if vars_ref_arr.ndim == 1 else np.max(vars_ref_arr, axis=1)
+                stop_idx = np.where((dists_goal < self.goal_stop_eps) & (step_unc > 1e-3))[0]
+                if stop_idx.size > 0:
+                    i_stop = int(stop_idx[0])
                     self.logger.info(
-                        f"[Predict] Reached goal at step {step}, d={d:.4f}"
+                        f"[Predict] Reached goal at step {i_stop}, d={dists_goal[i_stop]:.4f}"
                     )
-                    break
+                    preds_ref_pos_np = preds_ref_pos_np[: i_stop + 1]
+                    preds_world_pos = preds_world_pos[: i_stop + 1]
+                    preds_world_quat = preds_world_quat[: i_stop + 1]
+                    vars_ref = vars_ref[: i_stop + 1]
+                    if preds_world_force is not None:
+                        preds_world_force = preds_world_force[: i_stop + 1]
+
+            # Single history update for geometric drift check
+            cur_pos = np.vstack([cur_pos, preds_ref_pos_np])
 
             # Geometric drift check
             mse_full = geom_mse(cur_pos, ref_eq, min(len(cur_pos), len(ref_eq)))
@@ -344,12 +345,6 @@ class Predictor:
                 failed = True
 
             if not failed:
-                preds_world_pos = np.asarray(preds_world_pos)
-                preds_world_quat = np.asarray(preds_world_quat)
-                preds_world_force = (
-                    np.asarray(preds_world_force) if len(preds_world_force) else None
-                )
-
                 probe_end = probe_eq[-1]
                 dists = np.linalg.norm(preds_world_pos - probe_end, axis=1)
                 candidate_idxs = np.where(dists < self.max_start_jump)[0]
@@ -363,9 +358,7 @@ class Predictor:
                     i_start = int(candidate_idxs[0])
                     preds = preds_world_pos[i_start:]
                     preds_quat = preds_world_quat[i_start:]
-                    preds_force = (
-                        preds_world_force[i_start:] if preds_world_force is not None else None
-                    )
+                    preds_force = preds_world_force[i_start:] if preds_world_force is not None else None
                     break
 
             # Drop tail
