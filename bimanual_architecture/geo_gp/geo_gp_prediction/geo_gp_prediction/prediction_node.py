@@ -18,6 +18,10 @@ class PredictionNode(Node):
         self.declare_parameter("execution_running_topic", "/execution/running")
         self.declare_parameter("enabled_topic", "/geo_gp/enabled")
         self.declare_parameter("force_enabled_topic", "/geo_gp/force_prediction_enabled")
+        self.declare_parameter("progressive_publish", True)
+        self.declare_parameter("progressive_rollout_horizon", 50)
+        self.declare_parameter("progressive_rollout_step", 40)
+        self.declare_parameter("progressive_min_points", 30)
 
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value
@@ -32,6 +36,33 @@ class PredictionNode(Node):
         force_enabled_topic = self.get_parameter(
             "force_enabled_topic"
         ).get_parameter_value().string_value
+        self._progressive_publish = self.get_parameter(
+            "progressive_publish"
+        ).get_parameter_value().bool_value
+        self._progressive_rollout_horizon = max(
+            1,
+            int(
+                self.get_parameter("progressive_rollout_horizon")
+                .get_parameter_value()
+                .integer_value
+            ),
+        )
+        self._progressive_rollout_step = max(
+            1,
+            int(
+                self.get_parameter("progressive_rollout_step")
+                .get_parameter_value()
+                .integer_value
+            ),
+        )
+        self._progressive_min_points = max(
+            2,
+            int(
+                self.get_parameter("progressive_min_points")
+                .get_parameter_value()
+                .integer_value
+            ),
+        )
         self.predictor = Predictor(self.get_logger(), config_path, model_dir)
         self.qos_profile = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -49,8 +80,6 @@ class PredictionNode(Node):
         self._shutdown = False
         self._latest_prompt = None
         self._latest_seq = 0
-        self._worker_busy = False
-        self._last_published_seq = 0
         self._execution_running = False
         self._enabled = False
         self._force_enabled = False
@@ -148,18 +177,14 @@ class PredictionNode(Node):
                     if self._shutdown:
                         return
                     if self._latest_prompt is None:
-                        self._worker_busy = False
                         break
                     if not self._enabled:
                         self._latest_prompt = None
-                        self._worker_busy = False
                         break
                     if self._execution_running:
                         self._latest_prompt = None
-                        self._worker_busy = False
                         break
 
-                    self._worker_busy = True
                     seq, msg = self._latest_prompt
                     force_enabled = self._force_enabled
                     self._latest_prompt = None
@@ -168,6 +193,46 @@ class PredictionNode(Node):
                     f"Starting prediction for latest prompt seq={seq} with {len(msg.poses)} poses "
                     f"and force_enabled={force_enabled}"
                 )
+                if self._progressive_publish:
+                    published_any = False
+                    for idx, total_chunks, pred_chunk in self.predictor.iter_progressive_predictions(
+                        msg,
+                        predict_force=force_enabled,
+                        first_chunk_horizon=self._progressive_rollout_horizon,
+                        rollout_step=self._progressive_rollout_step,
+                    ):
+                        with self._lock:
+                            enabled = self._enabled
+                            execution_running = self._execution_running
+                        if not enabled:
+                            self.get_logger().info(
+                                f"Skipping progressive chunk publish for seq={seq} because Geo-GP is disabled"
+                            )
+                            break
+                        if execution_running and not published_any:
+                            self.get_logger().info(
+                                f"Skipping progressive chunk publish for seq={seq} because execution started early"
+                            )
+                            break
+                        if not pred_chunk.success:
+                            self.get_logger().info(
+                                f"Skipped progressive chunk {idx}/{total_chunks} | seq={seq} | unsuccessful prediction"
+                            )
+                            continue
+                        if len(pred_chunk.poses) < self._progressive_min_points and not published_any:
+                            self.get_logger().info(
+                                f"Skipped progressive chunk {idx}/{total_chunks} | seq={seq} | "
+                                f"poses={len(pred_chunk.poses)} below min_points={self._progressive_min_points}"
+                            )
+                            continue
+                        self.pred_pub.publish(pred_chunk)
+                        published_any = True
+                        self.get_logger().info(
+                            f"Published progressive chunk {idx}/{total_chunks} | seq={seq} "
+                            f"| poses={len(pred_chunk.poses)}"
+                        )
+                    continue
+
                 pred = self.predictor.predict(msg, predict_force=force_enabled)
                 with self._lock:
                     enabled = self._enabled
@@ -185,7 +250,6 @@ class PredictionNode(Node):
                     continue
 
                 self.pred_pub.publish(pred)
-                self._last_published_seq = seq
                 self.get_logger().info(
                     f"Published predicted trajectory | seq={seq} | success={pred.success} | "
                     f"skill={pred.skill_name} | confidence={pred.confidence}"

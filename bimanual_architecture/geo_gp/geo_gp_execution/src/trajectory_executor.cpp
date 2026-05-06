@@ -1,5 +1,7 @@
 #include "geo_gp_execution/trajectory_executor.hpp"
 
+#include <cmath>
+
 using std::placeholders::_1;
 using namespace std::chrono_literals;
 
@@ -28,6 +30,12 @@ TrajectoryExecutor::TrajectoryExecutor()
         "running_topic", "/execution/running");
     publish_rate_ = this->declare_parameter<double>(
         "rate", 200.0);
+    progressive_update_enabled_ = this->declare_parameter<bool>(
+        "progressive_update_enabled", true);
+    progressive_match_pos_eps_ = this->declare_parameter<double>(
+        "progressive_match_pos_eps", 1e-3);
+    progressive_match_time_eps_ = this->declare_parameter<double>(
+        "progressive_match_time_eps", 1e-3);
 
     sub_ = this->create_subscription<geo_gp_interfaces::msg::PredictedTrajectory>(
         input_topic_, 10,
@@ -71,6 +79,9 @@ void TrajectoryExecutor::trajectory_callback(
         return;
     }
 
+    const bool extend_in_place =
+        progressive_update_enabled_ && can_extend_trajectory_in_place(msg);
+
     trajectory_ = msg->poses;
     if (msg->forces.size() == msg->poses.size()) {
         force_trajectory_ = msg->forces;
@@ -99,10 +110,17 @@ void TrajectoryExecutor::trajectory_callback(
             "PredictedTrajectory.time_from_start size mismatch, fallback to fixed dt=%.6f s",
             dt);
     }
+    if (extend_in_place) {
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Extended running trajectory in-place | points=%zu",
+            trajectory_.size());
+        return;
+    }
+
     index_ = 0;
     executing_ = true;
     start_time_ = this->now();
-
     publish_running(pub_running_, true);
 }
 
@@ -170,6 +188,40 @@ double TrajectoryExecutor::select_force_axis(const geometry_msgs::msg::Vector3 &
         return force.y;
     }
     return force.z;
+}
+
+bool TrajectoryExecutor::can_extend_trajectory_in_place(
+    const geo_gp_interfaces::msg::PredictedTrajectory::SharedPtr msg) const {
+    if (!executing_ || trajectory_.empty() || trajectory_time_.empty()) {
+        return false;
+    }
+    if (msg->poses.size() <= trajectory_.size()) {
+        return false;
+    }
+    if (msg->time_from_start.size() != msg->poses.size()) {
+        return false;
+    }
+    if (trajectory_time_.size() != trajectory_.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < trajectory_.size(); ++i) {
+        const auto & old_p = trajectory_[i].position;
+        const auto & new_p = msg->poses[i].position;
+        const double dx = old_p.x - new_p.x;
+        const double dy = old_p.y - new_p.y;
+        const double dz = old_p.z - new_p.z;
+        const double pos_err = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (pos_err > progressive_match_pos_eps_) {
+            return false;
+        }
+        if (std::fabs(trajectory_time_[i] - msg->time_from_start[i]) >
+            progressive_match_time_eps_) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char ** argv) {

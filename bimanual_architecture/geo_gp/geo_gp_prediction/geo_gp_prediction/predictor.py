@@ -210,20 +210,7 @@ class Predictor:
 
         return out
 
-    def predict(self, prompt_msg: PromptTrajectory, predict_force: bool = True):
-        """
-        Predict the trajectory based on the prompt path.
-
-        Args:
-            prompt_msg (PromptTrajectory): The input prompt trajectory.
-
-        Returns:
-            PredictedTrajectory: The predicted trajectory.
-        """
-        t_predict_start = time.perf_counter()
-        input_type = "spherical"
-        output_type = "delta"
-
+    def prepare_prediction_context(self, prompt_msg: PromptTrajectory, predict_force: bool):
         target_speed = self.estimate_prompt_speed(prompt_msg)
         self.logger.info(f"Target execution speed from prompt: {target_speed:.4f} m/s")
 
@@ -248,17 +235,19 @@ class Predictor:
             probe_force_eq = None
 
         if len(probe_eq) < (self.k + 2):
-            self.logger.info("[Predict] Not enough probe points")
-            return self.numpy_to_predicted(
-                prompt_msg,
-                probe,
-                probe_quat,
-                probe_force,
-                target_speed=target_speed,
-                skill_name="",
-                success=False,
-                confidence=0.0
-            )
+            return {
+                "ok": False,
+                "predicted": self.numpy_to_predicted(
+                    prompt_msg,
+                    probe,
+                    probe_quat,
+                    probe_force,
+                    target_speed=target_speed,
+                    skill_name="",
+                    success=False,
+                    confidence=0.0,
+                ),
+            }
 
         probe_eq = moving_average_centered_pos(probe_eq, self.smooth_win)
         probe_quat_eq = moving_average_centered_6d(probe_quat_eq, self.smooth_win)
@@ -278,6 +267,42 @@ class Predictor:
         # 3) Transform to ref frame
         probe_in_ref = ((probe_eq - t) / s) @ R
         probe_goal = s * (ref_eq[-1] @ R.T) + t
+        return {
+            "ok": True,
+            "prompt_msg": prompt_msg,
+            "target_speed": target_speed,
+            "input_type": "spherical",
+            "output_type": "delta",
+            "match_ms": match_ms,
+            "skill": skill,
+            "R": R,
+            "s": s,
+            "t": t,
+            "ref_eq": ref_eq,
+            "probe_eq": probe_eq,
+            "probe_quat_eq": probe_quat_eq,
+            "probe_force_eq": probe_force_eq,
+            "probe_in_ref": probe_in_ref,
+            "probe_goal": probe_goal,
+        }
+
+    def predict_from_context(self, ctx, rollout_horizon_override=None):
+        t_predict_start = time.perf_counter()
+        skill = ctx["skill"]
+        R = ctx["R"]
+        s = ctx["s"]
+        t = ctx["t"]
+        ref_eq = ctx["ref_eq"]
+        probe_eq = ctx["probe_eq"]
+        probe_quat_eq = ctx["probe_quat_eq"]
+        probe_force_eq = ctx["probe_force_eq"]
+        probe_in_ref = ctx["probe_in_ref"]
+        probe_goal = ctx["probe_goal"]
+        target_speed = ctx["target_speed"]
+        input_type = ctx["input_type"]
+        output_type = ctx["output_type"]
+        match_ms = ctx["match_ms"]
+        model = skill.model
 
         # 4) Rollout
         t_rollout_start = time.perf_counter()
@@ -285,11 +310,16 @@ class Predictor:
         preds_quat = None
         preds_force = None
 
+        rollout_h = self.rollout_horizon
+        if rollout_horizon_override is not None:
+            rollout_h = max(1, int(rollout_horizon_override))
+
         for attempt in range(self.max_retries):
             cur_pos = probe_in_ref.copy()
             cur_quat = probe_quat_eq.copy()[:cur_pos.shape[0]]
             cur_force = None if probe_force_eq is None else probe_force_eq.copy()[:cur_pos.shape[0]]
             failed = False
+            hist_len = cur_pos.shape[0]
 
             tp = torch.tensor(cur_pos, dtype=torch.float32)
             tq = torch.tensor(cur_quat, dtype=torch.float32)
@@ -300,7 +330,7 @@ class Predictor:
                 tp,
                 tq,
                 start_t=cur_pos.shape[0] - 1,
-                h=self.rollout_horizon,
+                h=rollout_h,
                 k=self.k,
                 input_type=input_type,
                 output_type=output_type,
@@ -333,14 +363,25 @@ class Predictor:
                     if preds_world_force is not None:
                         preds_world_force = preds_world_force[: i_stop + 1]
 
-            # Single history update for geometric drift check
+            # Geometric drift check on the predicted chunk only
+            ref_tail_start = min(hist_len, len(ref_eq))
+            ref_tail = ref_eq[ref_tail_start:]
+            compare_len = min(len(preds_ref_pos_np), len(ref_tail))
+            if compare_len <= 0:
+                self.logger.info("[GeomCheck] No valid reference tail for chunk check, retry...")
+                failed = True
+            else:
+                mse_chunk = geom_mse(
+                    preds_ref_pos_np[:compare_len],
+                    ref_tail[:compare_len],
+                    compare_len,
+                )
+                self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.4f} (len={compare_len})")
+
+            # Single history update
             cur_pos = np.vstack([cur_pos, preds_ref_pos_np])
 
-            # Geometric drift check
-            mse_full = geom_mse(cur_pos, ref_eq, min(len(cur_pos), len(ref_eq)))
-            self.logger.info(f"[GeomCheck] full mse = {mse_full:.4f}")
-
-            if mse_full > self.mse_thresh:
+            if not failed and mse_chunk > self.mse_thresh:
                 self.logger.info("[Recover] Geometric drift detected, retry...")
                 failed = True
 
@@ -373,7 +414,7 @@ class Predictor:
         if preds is None:
             self.logger.info("[Predict] All retries failed. No prediction output.")
             return self.numpy_to_predicted(
-                prompt_msg,
+                ctx["prompt_msg"],
                 probe_eq,
                 probe_quat_eq,
                 probe_force_eq,
@@ -406,7 +447,7 @@ class Predictor:
 
         # 6) Numpy → ROS Path
         return self.numpy_to_predicted(
-            prompt_msg,
+            ctx["prompt_msg"],
             preds,
             preds_quat,
             preds_force,
@@ -415,3 +456,178 @@ class Predictor:
             success=True,
             confidence=1.0,
         )
+
+    def predict(
+        self,
+        prompt_msg: PromptTrajectory,
+        predict_force: bool = True,
+        rollout_horizon_override: int = None,
+    ):
+        ctx = self.prepare_prediction_context(prompt_msg, predict_force)
+        if not ctx["ok"]:
+            self.logger.info("[Predict] Not enough probe points")
+            return ctx["predicted"]
+        return self.predict_from_context(
+            ctx,
+            rollout_horizon_override=rollout_horizon_override,
+        )
+
+    def build_progressive_chunk_sizes(self, first_chunk_horizon: int, rollout_step: int):
+        first = max(1, int(first_chunk_horizon))
+        step = max(1, int(rollout_step))
+        max_h = max(1, int(self.rollout_horizon))
+        chunk_sizes = []
+        remaining = max_h
+        next_size = first
+        while remaining > 0:
+            size = min(next_size, remaining)
+            chunk_sizes.append(size)
+            remaining -= size
+            next_size = step
+        return chunk_sizes
+
+    def iter_progressive_predictions(
+        self,
+        prompt_msg: PromptTrajectory,
+        predict_force: bool,
+        first_chunk_horizon: int,
+        rollout_step: int,
+    ):
+        ctx = self.prepare_prediction_context(prompt_msg, predict_force)
+        if not ctx["ok"]:
+            self.logger.info("[Predict] Not enough probe points")
+            yield 1, 1, ctx["predicted"]
+            return
+
+        skill = ctx["skill"]
+        model = skill.model
+        R = ctx["R"]
+        s = ctx["s"]
+        t = ctx["t"]
+        ref_eq = ctx["ref_eq"]
+        probe_eq = ctx["probe_eq"]
+        probe_quat_eq = ctx["probe_quat_eq"]
+        probe_force_eq = ctx["probe_force_eq"]
+        probe_goal = ctx["probe_goal"]
+        target_speed = ctx["target_speed"]
+        prompt_msg_ctx = ctx["prompt_msg"]
+
+        cur_pos = ctx["probe_in_ref"].copy()
+        cur_quat = probe_quat_eq.copy()[:cur_pos.shape[0]]
+        cur_force = None if probe_force_eq is None else probe_force_eq.copy()[:cur_pos.shape[0]]
+
+        accepted_world_pos = None
+        accepted_world_quat = None
+        accepted_world_force = None
+
+        chunk_sizes = self.build_progressive_chunk_sizes(first_chunk_horizon, rollout_step)
+        total = len(chunk_sizes)
+
+        for idx, chunk_h in enumerate(chunk_sizes, start=1):
+            t_chunk_start = time.perf_counter()
+            hist_len = cur_pos.shape[0]
+            tp = torch.tensor(cur_pos, dtype=torch.float32)
+            tq = torch.tensor(cur_quat, dtype=torch.float32)
+            tf = None if cur_force is None else torch.tensor(cur_force, dtype=torch.float32)
+
+            preds_ref_pos, preds_quat, preds_ref_force, _, _, _, vars_ref = rollout_reference_6d(
+                model,
+                tp,
+                tq,
+                start_t=cur_pos.shape[0] - 1,
+                h=chunk_h,
+                k=self.k,
+                input_type=ctx["input_type"],
+                output_type=ctx["output_type"],
+                R_ref_probe=R,
+                traj_force=tf,
+            )
+
+            preds_ref_pos_np = preds_ref_pos.numpy()
+            preds_world_pos = s * (preds_ref_pos_np @ R.T) + t
+            preds_world_quat = preds_quat.numpy()
+            preds_world_force = None
+            if preds_ref_force is not None:
+                preds_world_force = preds_ref_force.numpy()
+
+            if preds_world_pos.shape[0] > 0:
+                dists_goal = np.linalg.norm(preds_world_pos - probe_goal, axis=1)
+                vars_ref_arr = np.asarray(vars_ref)
+                step_unc = vars_ref_arr if vars_ref_arr.ndim == 1 else np.max(vars_ref_arr, axis=1)
+                stop_idx = np.where((dists_goal < self.goal_stop_eps) & (step_unc > 1e-3))[0]
+                if stop_idx.size > 0:
+                    i_stop = int(stop_idx[0])
+                    preds_ref_pos_np = preds_ref_pos_np[: i_stop + 1]
+                    preds_world_pos = preds_world_pos[: i_stop + 1]
+                    preds_world_quat = preds_world_quat[: i_stop + 1]
+                    if preds_world_force is not None:
+                        preds_world_force = preds_world_force[: i_stop + 1]
+
+            if preds_ref_pos_np.shape[0] == 0:
+                self.logger.info("[Predict] Empty chunk prediction, stopping progressive rollout")
+                break
+
+            ref_tail_start = min(hist_len, len(ref_eq))
+            ref_tail = ref_eq[ref_tail_start:]
+            compare_len = min(len(preds_ref_pos_np), len(ref_tail))
+            if compare_len <= 0:
+                self.logger.info("[GeomCheck] No valid reference tail for chunk check, stop")
+                break
+            mse_chunk = geom_mse(
+                preds_ref_pos_np[:compare_len],
+                ref_tail[:compare_len],
+                compare_len,
+            )
+            self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.4f} (len={compare_len})")
+            if mse_chunk > self.mse_thresh:
+                self.logger.info("[Predict] Chunk check failed, stopping progressive rollout")
+                break
+
+            cur_tip_world = s * (cur_pos[-1] @ R.T) + t
+            jump_dist = np.linalg.norm(preds_world_pos - cur_tip_world, axis=1)
+            candidate_idxs = np.where(jump_dist < self.max_start_jump)[0]
+            if len(candidate_idxs) == 0:
+                self.logger.info("[Predict] No continuous chunk start found, stop")
+                break
+            i_start = int(candidate_idxs[0])
+
+            new_ref_pos = preds_ref_pos_np[i_start:]
+            new_world_pos = preds_world_pos[i_start:]
+            new_world_quat = preds_world_quat[i_start:]
+            new_world_force = preds_world_force[i_start:] if preds_world_force is not None else None
+            if new_world_pos.shape[0] == 0:
+                self.logger.info("[Predict] Filtered chunk became empty, stop")
+                break
+
+            if accepted_world_pos is None:
+                accepted_world_pos = new_world_pos
+                accepted_world_quat = new_world_quat
+                accepted_world_force = new_world_force
+            else:
+                accepted_world_pos = np.vstack([accepted_world_pos, new_world_pos])
+                accepted_world_quat = np.vstack([accepted_world_quat, new_world_quat])
+                if accepted_world_force is not None and new_world_force is not None:
+                    accepted_world_force = np.vstack([accepted_world_force, new_world_force])
+                elif accepted_world_force is None:
+                    accepted_world_force = new_world_force
+
+            cur_pos = np.vstack([cur_pos, new_ref_pos])
+            cur_quat = np.vstack([cur_quat, new_world_quat])
+            if cur_force is not None and new_world_force is not None:
+                cur_force = np.vstack([cur_force, new_world_force])
+
+            pred_msg = self.numpy_to_predicted(
+                prompt_msg_ctx,
+                accepted_world_pos,
+                accepted_world_quat,
+                accepted_world_force,
+                target_speed=target_speed,
+                skill_name=skill.name,
+                success=True,
+                confidence=1.0,
+            )
+            chunk_ms = (time.perf_counter() - t_chunk_start) * 1000.0
+            self.logger.info(
+                f"[Timing] chunk {idx}/{total} | predict_ms={chunk_ms:.2f}"
+            )
+            yield idx, total, pred_msg

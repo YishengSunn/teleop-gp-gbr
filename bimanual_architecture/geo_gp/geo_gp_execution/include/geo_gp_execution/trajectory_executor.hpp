@@ -19,6 +19,8 @@ private:
     void publish_pose(const geometry_msgs::msg::Pose & pose);
     void publish_force(const geometry_msgs::msg::Vector3 & force);
     double select_force_axis(const geometry_msgs::msg::Vector3 & force) const;
+    bool can_extend_trajectory_in_place(
+        const geo_gp_interfaces::msg::PredictedTrajectory::SharedPtr msg) const;
 
     rclcpp::Subscription<geo_gp_interfaces::msg::PredictedTrajectory>::SharedPtr sub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_;
@@ -36,6 +38,9 @@ private:
     std::string force_axis_;
     std::string running_topic_;
     double publish_rate_;
+    bool progressive_update_enabled_;
+    double progressive_match_pos_eps_;
+    double progressive_match_time_eps_;
 
     size_t index_;
     bool executing_;
