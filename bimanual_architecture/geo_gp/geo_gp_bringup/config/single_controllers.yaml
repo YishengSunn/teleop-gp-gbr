@@ -169,7 +169,7 @@ leader:
 
       # Processing (after subscribe, before writing leader effort)
       subtract_first_bias: true  # Use first good sample as bias so feedback starts near zero
-      feedback_scale: 1.0
+      feedback_scale: 0.5
       feedback_max_abs_tau: 15.0  # Per-joint limit after scale (Nm)
 
       # During move-to-start: if true, add feedback on top of PD; if false, feedback only after move-to-start
