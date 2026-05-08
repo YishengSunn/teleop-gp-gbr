@@ -376,7 +376,7 @@ class Predictor:
                     ref_tail[:compare_len],
                     compare_len,
                 )
-                self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.4f} (len={compare_len})")
+                self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.5f} (len={compare_len})")
 
             # Single history update
             cur_pos = np.vstack([cur_pos, preds_ref_pos_np])
@@ -525,6 +525,7 @@ class Predictor:
 
         for idx, chunk_h in enumerate(chunk_sizes, start=1):
             t_chunk_start = time.perf_counter()
+            reached_goal_in_chunk = False
             hist_len = cur_pos.shape[0]
             tp = torch.tensor(cur_pos, dtype=torch.float32)
             tq = torch.tensor(cur_quat, dtype=torch.float32)
@@ -557,6 +558,7 @@ class Predictor:
                 stop_idx = np.where((dists_goal < self.goal_stop_eps) & (step_unc > 1e-3))[0]
                 if stop_idx.size > 0:
                     i_stop = int(stop_idx[0])
+                    reached_goal_in_chunk = True
                     preds_ref_pos_np = preds_ref_pos_np[: i_stop + 1]
                     preds_world_pos = preds_world_pos[: i_stop + 1]
                     preds_world_quat = preds_world_quat[: i_stop + 1]
@@ -578,7 +580,7 @@ class Predictor:
                 ref_tail[:compare_len],
                 compare_len,
             )
-            self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.4f} (len={compare_len})")
+            self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.5f} (len={compare_len})")
             if mse_chunk > self.mse_thresh:
                 self.logger.info("[Predict] Chunk check failed, stopping progressive rollout")
                 break
@@ -631,3 +633,8 @@ class Predictor:
                 f"[Timing] chunk {idx}/{total} | predict_ms={chunk_ms:.2f}"
             )
             yield idx, total, pred_msg
+            if reached_goal_in_chunk:
+                self.logger.info(
+                    "[Predict] Reached goal in current chunk, stop further progressive prediction"
+                )
+                break

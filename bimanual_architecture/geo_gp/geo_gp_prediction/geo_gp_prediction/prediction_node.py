@@ -19,9 +19,9 @@ class PredictionNode(Node):
         self.declare_parameter("enabled_topic", "/geo_gp/enabled")
         self.declare_parameter("force_enabled_topic", "/geo_gp/force_prediction_enabled")
         self.declare_parameter("progressive_publish", True)
-        self.declare_parameter("progressive_rollout_horizon", 50)
-        self.declare_parameter("progressive_rollout_step", 40)
-        self.declare_parameter("progressive_min_points", 30)
+        self.declare_parameter("progressive_rollout_horizon", 15)
+        self.declare_parameter("progressive_rollout_step", 15)
+        self.declare_parameter("progressive_min_points", 10)
 
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value
