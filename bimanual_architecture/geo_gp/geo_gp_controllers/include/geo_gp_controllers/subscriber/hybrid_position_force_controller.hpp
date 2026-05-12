@@ -137,6 +137,7 @@ private:
   double force_error_integral_{0.0};
   double filtered_force_measurement_{0.0};
   bool force_filter_initialized_{false};
+  bool last_execution_running_for_z_axis_{false};
 
   void leaderRobotStateCallback(const franka_msgs::msg::FrankaState& msg);
   void executionDesiredPoseCallback(const std_msgs::msg::Float64MultiArray& msg);

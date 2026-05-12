@@ -289,44 +289,55 @@ controller_interface::return_type HybridPositionForceController::update(
   Eigen::AngleAxisd rot_error_aa(rot_error);
   Vector3d orientation_error = rot_error_aa.axis() * rot_error_aa.angle();
 
+  // Z (force_axis_) uses Cartesian impedance while teleoperating; during prediction
+  // execution (execution_running) it uses the force controller on that axis.
+  const bool force_control_on_hybrid_axis =
+      execution_running_.load(std::memory_order_relaxed);
+  if (force_control_on_hybrid_axis != last_execution_running_for_z_axis_) {
+    force_error_integral_ = 0.0;
+    last_execution_running_for_z_axis_ = force_control_on_hybrid_axis;
+  }
+
   Vector6d wrench_command = Vector6d::Zero();
   for (int axis = 0; axis < 3; ++axis) {
-    if (axis == force_axis_) {
+    if (force_control_on_hybrid_axis && axis == force_axis_) {
       continue;
     }
     wrench_command(axis) = -pos_stiff_ * position_error(axis) -
                            translational_damping_ * linear_velocity(axis);
   }
 
-  double raw_force_measurement = robot_state->O_F_ext_hat_K[force_axis_];
-  if (!std::isfinite(raw_force_measurement)) {
-    raw_force_measurement =
-        force_filter_initialized_ ? filtered_force_measurement_ : 0.0;
-  }
+  if (force_control_on_hybrid_axis) {
+    double raw_force_measurement = robot_state->O_F_ext_hat_K[force_axis_];
+    if (!std::isfinite(raw_force_measurement)) {
+      raw_force_measurement =
+          force_filter_initialized_ ? filtered_force_measurement_ : 0.0;
+    }
 
-  if (!force_filter_initialized_) {
-    filtered_force_measurement_ = raw_force_measurement;
-    force_filter_initialized_ = true;
-  }
-  else {
-    filtered_force_measurement_ =
-        measured_force_filter_alpha_ * filtered_force_measurement_ +
-        (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
-  }
+    if (!force_filter_initialized_) {
+      filtered_force_measurement_ = raw_force_measurement;
+      force_filter_initialized_ = true;
+    }
+    else {
+      filtered_force_measurement_ =
+          measured_force_filter_alpha_ * filtered_force_measurement_ +
+          (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
+    }
 
-  const double force_error = desired_force_rt_.value - filtered_force_measurement_;
-  const double dt = std::max(1e-6, period.seconds());
-  force_error_integral_ =
-      clampRange(force_error_integral_ + dt * force_error,
-                 -force_integral_limit_, force_integral_limit_);
+    const double force_error = desired_force_rt_.value - filtered_force_measurement_;
+    const double dt = std::max(1e-6, period.seconds());
+    force_error_integral_ =
+        clampRange(force_error_integral_ + dt * force_error,
+                   -force_integral_limit_, force_integral_limit_);
 
-  double hybrid_axis_wrench =
-      force_feedforward_scale_ * desired_force_rt_.value +
-      force_kp_ * force_error +
-      force_ki_ * force_error_integral_ -
-      force_damping_ * linear_velocity(force_axis_);
-  hybrid_axis_wrench = clampAbs(hybrid_axis_wrench, force_command_max_abs_);
-  wrench_command(force_axis_) = hybrid_axis_wrench;
+    double hybrid_axis_wrench =
+        force_feedforward_scale_ * desired_force_rt_.value +
+        force_kp_ * force_error +
+        force_ki_ * force_error_integral_ -
+        force_damping_ * linear_velocity(force_axis_);
+    hybrid_axis_wrench = clampAbs(hybrid_axis_wrench, force_command_max_abs_);
+    wrench_command(force_axis_) = hybrid_axis_wrench;
+  }
 
   wrench_command.tail(3) =
       -rot_stiff_ * orientation_error - rotational_damping_ * angular_velocity;
@@ -589,6 +600,7 @@ CallbackReturn HybridPositionForceController::on_activate(
   force_error_integral_ = 0.0;
   filtered_force_measurement_ = 0.0;
   force_filter_initialized_ = false;
+  last_execution_running_for_z_axis_ = false;
   dq_filtered_.setZero();
 
   if (pub_blend_running_) {
