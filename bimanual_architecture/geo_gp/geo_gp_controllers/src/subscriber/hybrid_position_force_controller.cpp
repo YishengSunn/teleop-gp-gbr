@@ -242,8 +242,7 @@ controller_interface::return_type HybridPositionForceController::updateWithoutTd
   if (pending_blend_to_leader_.load(std::memory_order_acquire)) {
     if (!blend_to_leader_enabled_) {
       pending_blend_to_leader_.store(false, std::memory_order_release);
-    }
-    else {
+    } else {
       const auto* goal = leader_pose_cache_.readFromRT();
       if (goal) {
         pending_blend_to_leader_.store(false, std::memory_order_release);
@@ -278,8 +277,7 @@ controller_interface::return_type HybridPositionForceController::updateWithoutTd
         mode_.store(
             static_cast<uint8_t>(Mode::BLEND_TO_LEADER), std::memory_order_release);
         skip_pose_read_this_cycle = true;
-      }
-      else {
+      } else {
         static int log_ctr = 0;
         if (++log_ctr % 500 == 0) {
           RCLCPP_WARN(
@@ -358,8 +356,7 @@ controller_interface::return_type HybridPositionForceController::updateWithoutTd
       desired_pose_rt_.qz);
   if (desired_orientation.norm() < 1e-9) {
     desired_orientation = Quaterniond::Identity();
-  }
-  else {
+  } else {
     desired_orientation.normalize();
   }
 
@@ -404,8 +401,7 @@ controller_interface::return_type HybridPositionForceController::updateWithoutTd
     if (!force_filter_initialized_) {
       filtered_force_measurement_ = raw_force_measurement;
       force_filter_initialized_ = true;
-    }
-    else {
+    } else {
       filtered_force_measurement_ =
           measured_force_filter_alpha_ * filtered_force_measurement_ +
           (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
@@ -541,8 +537,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
   if (pending_blend_to_leader_.load(std::memory_order_acquire)) {
     if (!blend_to_leader_enabled_) {
       pending_blend_to_leader_.store(false, std::memory_order_release);
-    }
-    else {
+    } else {
       const auto* goal = leader_pose_cache_.readFromRT();
       if (goal) {
         pending_blend_to_leader_.store(false, std::memory_order_release);
@@ -578,8 +573,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
             static_cast<uint8_t>(Mode::BLEND_TO_LEADER), std::memory_order_release);
         skip_pose_read_this_cycle = true;
         skip_tdpa_cmd_read_this_cycle = true;
-      }
-      else {
+      } else {
         static int log_ctr = 0;
         if (++log_ctr % 500 == 0) {
           RCLCPP_WARN(
@@ -777,8 +771,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
     for (int i = 0; i < kCartDims; ++i) {
       position_error_tdpa_(i) = x_remote_delta_intgl_(i) - x_remote_delta_(i);
     }
-  }
-  else {
+  } else {
     desired_position << desired_pose_rt_.px, desired_pose_rt_.py, desired_pose_rt_.pz;
     desired_orientation = quatFromDesiredPose(desired_pose_rt_);
   }
@@ -815,8 +808,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
     if (!force_filter_initialized_) {
       filtered_force_measurement_ = raw_force_measurement;
       force_filter_initialized_ = true;
-    }
-    else {
+    } else {
       filtered_force_measurement_ =
           measured_force_filter_alpha_ * filtered_force_measurement_ +
           (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
@@ -1221,8 +1213,7 @@ CallbackReturn HybridPositionForceController::on_activate(
     motion_generator_ = std::make_unique<MotionGenerator>(0.2, q, q_start_);
     start_time_ = this->get_node()->now();
     mode_.store(static_cast<uint8_t>(Mode::MOVE_TO_START), std::memory_order_release);
-  }
-  else {
+  } else {
     mode_.store(static_cast<uint8_t>(Mode::HYBRID), std::memory_order_release);
     accept_desired_.store(true, std::memory_order_release);
   }
