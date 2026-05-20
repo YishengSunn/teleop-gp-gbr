@@ -1,13 +1,15 @@
-#include <geo_gp_controllers/subscriber/cartesian_impedance_controller.hpp>
+#include "geo_gp_controllers/subscriber/cartesian_impedance_controller.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <string>
-#include <chrono>
-#include <algorithm>
 
 #include <franka/model.h>
+#include <franka/rate_limiting.h>
 
 inline void pseudoInverse(const Eigen::MatrixXd& M_, Eigen::MatrixXd& M_pinv_, bool damped = true) {
   double lambda_ = damped ? 0.2 : 0.0;
@@ -27,6 +29,15 @@ inline void pseudoInverse(const Eigen::MatrixXd& M_, Eigen::MatrixXd& M_pinv_, b
 namespace geo_gp_controllers {
 
 namespace {
+
+inline double safePeriodSeconds(const rclcpp::Duration& period) {
+  const double dt = period.seconds();
+  if (!std::isfinite(dt) || dt <= 0.0) {
+    return 0.001;
+  }
+  return dt;
+}
+
 Quaterniond slerpShortestArc(const Quaterniond& q0_in, const Quaterniond& q1_in, double s) {
   Quaterniond q0 = q0_in.normalized();
   Quaterniond q1 = q1_in.normalized();
@@ -55,15 +66,421 @@ CartesianImpedanceController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
-  for (const auto& name : franka_robot_model_->get_state_interface_names()) {
-    config.names.push_back(name);
+  if (TDPA_active_) {
+    for (int i = 1; i <= num_joints; ++i) {
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
+    }
+
+    if (franka_robot_model_) {
+      for (const auto& name : franka_robot_model_->get_state_interface_names()) {
+        config.names.push_back(name);
+      }
+    }
+
+    if (franka_robot_state_) {
+      for (const auto& n : franka_robot_state_->get_state_interface_names()) {
+        config.names.push_back(n);
+      }
+    } else {
+      franka_semantic_components::FrankaRobotState tmp_state(arm_id_ + "/robot_state", arm_id_);
+      for (const auto& n : tmp_state.get_state_interface_names()) {
+        config.names.push_back(n);
+      }
+    }
+  } else {
+    for (const auto& name : franka_robot_model_->get_state_interface_names()) {
+      config.names.push_back(name);
+    }
   }
+
   return config;
 }
 
+Vector6d
+CartesianImpedanceController::wrenchFromTorque(
+    const Matrix6x7d& jacobian,
+    const Matrix7d& mass,
+    const Vector7d& tau_ext) {
+  const Matrix7d mass_inv = mass.inverse();
+  const Matrix6d mass_c = (jacobian * mass_inv * jacobian.transpose()).inverse();
+  return (mass_inv * jacobian.transpose() * mass_c).transpose() * tau_ext;
+}
+
+Vector3d
+CartesianImpedanceController::quatErrorToRotvec(
+    const Quaterniond& current,
+    const Quaterniond& desired) {
+  Quaterniond q_cur = current;
+  Quaterniond q_des = desired;
+
+  if (q_cur.coeffs().dot(q_des.coeffs()) < 0.0) {
+    q_des.coeffs() = -q_des.coeffs();
+  }
+
+  Quaterniond q_err = q_des * q_cur.inverse();
+  q_err.normalize();
+
+  Eigen::AngleAxisd aa(q_err);
+  if (!std::isfinite(aa.angle()) || std::abs(aa.angle()) < 1e-12) {
+    return Vector3d::Zero();
+  }
+
+  return aa.axis() * aa.angle();
+}
+
+Matrix3d
+CartesianImpedanceController::skewMatrix(const Vector3d& w) {
+  Matrix3d S = Matrix3d::Zero();
+
+  S(0, 1) = -w(2);
+  S(0, 2) =  w(1);
+  S(1, 0) =  w(2);
+  S(1, 2) = -w(0);
+  S(2, 0) = -w(1);
+  S(2, 1) =  w(0);
+
+  return S;
+}
+
+Matrix3d
+CartesianImpedanceController::projectToSO3(const Matrix3d& R) {
+  Eigen::JacobiSVD<Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Matrix3d R_proj = svd.matrixU() * svd.matrixV().transpose();
+
+  if (R_proj.determinant() < 0.0) {
+    Matrix3d U = svd.matrixU();
+    U.col(2) *= -1.0;
+    R_proj = U * svd.matrixV().transpose();
+  }
+
+  return R_proj;
+}
+
+Matrix3d
+CartesianImpedanceController::integrateRotationWorld(
+    const Matrix3d& R,
+    const Vector3d& omega_world,
+    double dt) {
+  Matrix3d R_next = R + dt * skewMatrix(omega_world) * R;
+  return projectToSO3(R_next);
+}
+
+void CartesianImpedanceController::updateJointStates() {
+  for (int i = 0; i < num_joints; ++i) {
+    const auto& position_interface = state_interfaces_.at(2 * i);
+    const auto& velocity_interface = state_interfaces_.at(2 * i + 1);
+
+    assert(position_interface.get_interface_name() == "position");
+    assert(velocity_interface.get_interface_name() == "velocity");
+
+    q_(i) = position_interface.get_value();
+    dq_(i) = velocity_interface.get_value();
+  }
+}
+
 controller_interface::return_type
-CartesianImpedanceController::update(const rclcpp::Time& /*time*/,
-                                     const rclcpp::Duration& /*period*/) {
+CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
+                                           const rclcpp::Duration& period) {
+  updateJointStates();
+
+  bool skip_buffer_read_this_cycle = false;
+
+  const auto mode_now = static_cast<Mode>(mode_.load(std::memory_order_relaxed));
+
+  if (mode_now == Mode::MOVE_TO_START) {
+    const auto t = this->get_node()->now() - start_time_;
+    const auto out = motion_generator_->getDesiredJointPositions(t);
+
+    const Vector7d q_desired_move = out.first;
+    const bool finished = out.second;
+
+    if (!finished) {
+      const double kAlpha = 0.99;
+      dq_filtered_ = (1.0 - kAlpha) * dq_filtered_ + kAlpha * dq_;
+
+      const Vector7d tau =
+          k_start_.cwiseProduct(q_desired_move - q_) +
+          d_start_.cwiseProduct(-dq_filtered_);
+
+      for (int i = 0; i < num_joints; ++i) {
+        command_interfaces_[i].set_value(tau(i));
+      }
+
+      return controller_interface::return_type::OK;
+    }
+
+    Eigen::Map<const Matrix4d> pose_after_move(
+        franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
+
+    position_start_ = pose_after_move.block<3, 1>(0, 3);
+    orientation_start_ = Quaterniond(pose_after_move.block<3, 3>(0, 0));
+    orientation_start_.normalize();
+
+    desired_position_ = position_start_;
+    desired_orientation_ = orientation_start_;
+    desired_rotation_ = orientation_start_.toRotationMatrix();
+    desired_qn_ = q_;
+
+    CartesianArray cur{};
+    cur.fill(0.0);
+    xdot_cmd_buffer_.writeFromNonRT(cur);
+    wrench_cmd_buffer_.writeFromNonRT(cur);
+
+    last_desired_seq_ = desired_seq_.load(std::memory_order_acquire);
+
+    pandatime_ = 0.0;
+    remote_pandatime_ = 0.0;
+
+    tdpaReset_();
+
+    accept_desired_.store(true, std::memory_order_release);
+    mode_.store(static_cast<uint8_t>(Mode::CARTESIAN), std::memory_order_release);
+
+    skip_buffer_read_this_cycle = true;
+  }
+
+  const double dt = safePeriodSeconds(period);
+  pandatime_ += dt;
+
+  if (!skip_buffer_read_this_cycle) {
+    const uint64_t seq = desired_seq_.load(std::memory_order_acquire);
+
+    if (seq != last_desired_seq_) {
+      const auto* xdot_ptr = xdot_cmd_buffer_.readFromRT();
+      const auto* wrench_ptr = wrench_cmd_buffer_.readFromRT();
+
+      if (xdot_ptr != nullptr) {
+        for (int i = 0; i < cart_dims; ++i) {
+          xdot_remote_(i) = (*xdot_ptr)[static_cast<size_t>(i)];
+        }
+      }
+
+      if (wrench_ptr != nullptr) {
+        for (int i = 0; i < cart_dims; ++i) {
+          wrench_remote_(i) = (*wrench_ptr)[static_cast<size_t>(i)];
+        }
+      }
+
+      last_desired_seq_ = seq;
+    }
+  }
+
+  Eigen::Map<const Matrix4d> current_pose(
+      franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
+
+  const Vector3d current_position(current_pose.block<3, 1>(0, 3));
+
+  Quaterniond current_orientation(current_pose.block<3, 3>(0, 0));
+  current_orientation.normalize();
+
+  Matrix6x7d jacobian(
+      franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector).data());
+
+  const auto mass_array = franka_robot_model_->getMassMatrix();
+  const Matrix7d mass = Eigen::Map<const Matrix7d>(mass_array.data());
+
+  xdot_local_ = jacobian * dq_;
+
+  x_local_delta_.head<3>() = current_position - position_start_;
+  x_local_delta_.tail<3>() =
+      quatErrorToRotvec(orientation_start_, current_orientation);
+
+  Vector6d xdot_remote_mod = xdot_remote_;
+  for (int i = 0; i < 3; ++i) {
+    xdot_remote_mod(i) -= K_drift_ * position_error_(i);
+  }
+
+  for (int i = 0; i < num_joints; ++i) {
+    tau_ext_(i) = -franka_robot_state_->get_robot_state_ptr()->tau_ext_hat_filtered[i];
+  }
+
+  wrench_ext_ = wrenchFromTorque(jacobian, mass, tau_ext_);
+
+  const double gain_tau_f = tau_ext_feedback_ ? 1.0 : -1.0;
+
+  double v_remote_linear[6]{};
+  double v_remote_rotational[6]{};
+  double f_old_linear[6]{};
+  double f_old_rotational[6]{};
+  double v_des_linear[6]{};
+  double v_des_rotational[6]{};
+
+  for (int i = 0; i < 3; ++i) {
+    const double old_linear =
+        tau_ext_feedback_ ? wrench_ext_(i)
+                          : (wrench_applied_initialized_ ? wrench_applied_(i) : 0.0);
+
+    const double old_rotational =
+        tau_ext_feedback_ ? wrench_ext_(i + 3)
+                          : (wrench_applied_initialized_ ? wrench_applied_(i + 3) : 0.0);
+
+    v_remote_linear[i] = xdot_remote_mod(i);
+    v_remote_rotational[i + 3] = xdot_remote_mod(i + 3);
+
+    f_old_linear[i] = gain_tau_f * old_linear;
+    f_old_rotational[i + 3] = gain_tau_f * old_rotational;
+
+    v_des_linear[i] = v_remote_linear[i];
+    v_des_rotational[i + 3] = v_remote_rotational[i + 3];
+  }
+
+  followerPC_linear_.energyObserver(v_remote_linear, f_old_linear, dt);
+  followerPC_rotational_.energyObserver(v_remote_rotational, f_old_rotational, dt);
+
+  const Matrix3d damping_linear = damping_.topLeftCorner<3, 3>();
+  const Matrix3d damping_rotational = damping_.bottomRightCorner<3, 3>();
+
+  const double dissipation_linear =
+      xdot_local_.head<3>().dot(damping_linear * xdot_local_.head<3>());
+
+  const double dissipation_rotational =
+      xdot_local_.tail<3>().dot(damping_rotational * xdot_local_.tail<3>());
+
+  shortage_linear_ += dt * eta_ * dissipation_linear;
+  shortage_rotational_ += dt * eta_ * dissipation_rotational;
+  shortage_ = shortage_linear_ + shortage_rotational_;
+
+  followerPC_linear_.energyController(
+      v_des_linear,
+      f_old_linear,
+      E_L_in_delayed_linear_ + shortage_linear_,
+      dt);
+
+  followerPC_rotational_.energyController(
+      v_des_rotational,
+      f_old_rotational,
+      E_L_in_delayed_rotational_ + shortage_rotational_,
+      dt);
+
+  Vector6d xdot_des = Vector6d::Zero();
+
+  for (int i = 0; i < 3; ++i) {
+    xdot_des(i) = v_des_linear[i];
+    xdot_des(i + 3) = v_des_rotational[i + 3];
+  }
+
+  desired_position_ += dt * xdot_des.head<3>();
+
+  desired_rotation_ =
+      integrateRotationWorld(desired_rotation_, xdot_des.tail<3>(), dt);
+
+  desired_orientation_ = Quaterniond(desired_rotation_);
+  desired_orientation_.normalize();
+
+  x_remote_delta_intgl_.head<3>() = desired_position_ - position_start_;
+  x_remote_delta_intgl_.tail<3>() =
+      quatErrorToRotvec(orientation_start_, desired_orientation_);
+
+  x_des_ = x_remote_delta_intgl_;
+
+  position_error_.setZero();
+  position_error_.head<3>() =
+      x_remote_delta_intgl_.head<3>() - x_remote_delta_.head<3>();
+
+  Vector6d error = Vector6d::Zero();
+  error.head<3>() = desired_position_ - current_position;
+  error.tail<3>() =
+      quatErrorToRotvec(current_orientation, desired_orientation_);
+
+  const Vector6d vel_error_tdpa = xdot_des - xdot_local_;
+  const Vector6d vel_error_nom = xdot_remote_mod - xdot_local_;
+
+  wrench_c_ = stiffness_ * error + damping_ * vel_error_tdpa;
+  wrench_c_no_mod_dq_ = stiffness_ * error + damping_ * vel_error_nom;
+  wrench_diff_ = wrench_c_no_mod_dq_ - wrench_c_;
+
+  beta_linear_ = followerPC_linear_.getBeta();
+  beta_rotational_ = followerPC_rotational_.getBeta();
+  beta_ = std::max(std::abs(beta_linear_), std::abs(beta_rotational_));
+
+  E_F_in_linear_ = followerPC_linear_.getInputEnergyFlow();
+  E_F_in_rotational_ = followerPC_rotational_.getInputEnergyFlow();
+  E_F_in_ = E_F_in_linear_ + E_F_in_rotational_;
+
+  E_F_out_linear_ = followerPC_linear_.getOutputEnergyFlow();
+  E_F_out_rotational_ = followerPC_rotational_.getOutputEnergyFlow();
+  E_F_out_ = E_F_out_linear_ + E_F_out_rotational_;
+
+  E_F_diss_linear_ = followerPC_linear_.getDissipatedEnergyFlow();
+  E_F_diss_rotational_ = followerPC_rotational_.getDissipatedEnergyFlow();
+  E_F_diss_ = E_F_diss_linear_ + E_F_diss_rotational_;
+
+  Eigen::MatrixXd jacobian_transpose_pinv;
+  pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
+
+  const Vector7d tau_task = jacobian.transpose() * wrench_c_;
+
+  const Vector7d tau_nullspace =
+      (Matrix7d::Identity() - jacobian.transpose() * jacobian_transpose_pinv) *
+      (n_stiffness_ * (desired_qn_ - q_) -
+       (2.0 * std::sqrt(n_stiffness_)) * dq_);
+
+  const Vector7d tau_d = tau_task + tau_nullspace;
+
+  std::array<double, 7> tau_des{};
+  std::array<double, 7> tau_prev{};
+
+  for (int i = 0; i < num_joints; ++i) {
+    tau_des[static_cast<size_t>(i)] = tau_d(i);
+    tau_prev[static_cast<size_t>(i)] =
+        last_tau_cmd_initialized_ ? last_tau_cmd_(i) : tau_d(i);
+  }
+
+  const auto tau_limited =
+      franka::limitRate(franka::kMaxTorqueRate, tau_des, tau_prev);
+
+  Vector7d tau_applied = Vector7d::Zero();
+
+  for (int i = 0; i < num_joints; ++i) {
+    tau_applied(i) = tau_limited[static_cast<size_t>(i)];
+    command_interfaces_[i].set_value(tau_applied(i));
+    last_tau_cmd_(i) = tau_applied(i);
+  }
+
+  last_tau_cmd_initialized_ = true;
+
+  const Vector7d tau_task_applied = tau_applied - tau_nullspace;
+  wrench_applied_ = wrenchFromTorque(jacobian, mass, tau_task_applied);
+  wrench_applied_initialized_ = true;
+
+  if (local_state_pub_ && local_state_pub_->trylock()) {
+    auto& msg = local_state_pub_->msg_;
+
+    const rclcpp::Time now = get_node()->now();
+    const int64_t now_ns = now.nanoseconds();
+
+    msg.header.stamp = now;
+    msg.seq = local_seq_++;
+    msg.tx_time_ns = now_ns;
+    msg.echo_seq = last_received_remote_seq_;
+    msg.echo_tx_time_ns = last_received_remote_tx_time_ns_;
+    msg.pandatime = pandatime_;
+
+    for (int i = 0; i < cart_dims; ++i) {
+      msg.x_local_delta[static_cast<size_t>(i)] = x_local_delta_(i);
+      msg.xdot_local[static_cast<size_t>(i)] = xdot_local_(i);
+      msg.wrench_local[static_cast<size_t>(i)] =
+          tau_ext_feedback_ ? wrench_ext_(i) : wrench_applied_(i);
+    }
+
+    msg.energy = E_F_in_;
+    msg.energy_linear = E_F_in_linear_;
+    msg.energy_rotational = E_F_in_rotational_;
+
+    local_state_pub_->unlockAndPublish();
+  }
+
+  return controller_interface::return_type::OK;
+}
+
+controller_interface::return_type
+CartesianImpedanceController::update(const rclcpp::Time& time,
+                                     const rclcpp::Duration& period) {
+  if (TDPA_active_) {
+    return updateTdpa_(time, period);
+  }
+
   Eigen::Map<const Matrix4d> current(
       franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
 
@@ -304,30 +721,12 @@ CartesianImpedanceController::on_init() {
     auto_declare<std::vector<double>>("start_k_gains", { 600.0 ,600.0 ,600.0 ,600.0 ,250.0 ,150.0 ,50.0 });
     auto_declare<std::vector<double>>("start_d_gains", { 30.0 ,30.0 ,30.0 ,30.0 ,10.0 ,10.0 ,5.0 });
 
-    sub_leader_robot_state_ =
-        get_node()->create_subscription<franka_msgs::msg::FrankaState>(
-            get_node()->get_parameter("leader_robot_state_topic").as_string(),
-            rclcpp::QoS(1),
-            std::bind(&CartesianImpedanceController::leaderRobotStateCallback, this,
-                      std::placeholders::_1));
-
-    sub_execution_pose_ =
-        get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
-            get_node()->get_parameter("execution_pose_topic").as_string(),
-            rclcpp::QoS(10),
-            std::bind(&CartesianImpedanceController::executionDesiredPoseCallback, this,
-                      std::placeholders::_1));
-
-    sub_execution_running_ =
-        get_node()->create_subscription<std_msgs::msg::Bool>(
-            get_node()->get_parameter("execution_running_topic").as_string(),
-            rclcpp::QoS(1).transient_local(),
-            std::bind(&CartesianImpedanceController::executionRunningCallback, this,
-                      std::placeholders::_1));
-
-    pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
-        get_node()->get_parameter("blend_running_topic").as_string(),
-        rclcpp::QoS(1).transient_local());
+    auto_declare<bool>("TDPA_active", false);
+    auto_declare<bool>("tau_ext_feedback", false);
+    auto_declare<double>("k_pos_drift", 0.0);
+    auto_declare<double>("eta_passivity_shortage", 0.0);
+    auto_declare<std::string>("remote_state_topic", "leader/tdpa_cartesian_state");
+    auto_declare<std::string>("local_state_topic", "follower/tdpa_cartesian_state");
 
   }
 
@@ -362,6 +761,13 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
   blend_duration_max_ = get_node()->get_parameter("blend_duration_max").as_double();
   blend_running_hold_sec_ = get_node()->get_parameter("blend_running_hold_sec").as_double();
 
+  TDPA_active_ = get_node()->get_parameter("TDPA_active").as_bool();
+  tau_ext_feedback_ = get_node()->get_parameter("tau_ext_feedback").as_bool();
+  K_drift_ = get_node()->get_parameter("k_pos_drift").as_double();
+  eta_ = get_node()->get_parameter("eta_passivity_shortage").as_double();
+  remote_state_topic_ = get_node()->get_parameter("remote_state_topic").as_string();
+  local_state_topic_ = get_node()->get_parameter("local_state_topic").as_string();
+
   move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
   const auto start_q = get_node()->get_parameter("start_joint_configuration").as_double_array();
   if (start_q.size() != static_cast<size_t>(num_joints)) {
@@ -391,6 +797,67 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
       franka_semantic_components::FrankaRobotModel(arm_id_ + "/robot_model", arm_id_));
 
+  if (TDPA_active_) {
+    franka_robot_state_ = std::make_unique<franka_semantic_components::FrankaRobotState>(
+        franka_semantic_components::FrankaRobotState(arm_id_ + "/robot_state", arm_id_));
+
+    stiffness_.setZero();
+    stiffness_.topLeftCorner<3, 3>() = pos_stiff_ * Matrix3d::Identity();
+    stiffness_.bottomRightCorner<3, 3>() = rot_stiff_ * Matrix3d::Identity();
+
+    damping_.setZero();
+    damping_.topLeftCorner<3, 3>() = 2.0 * std::sqrt(pos_stiff_) * Matrix3d::Identity();
+    damping_.bottomRightCorner<3, 3>() =
+        0.8 * 2.0 * std::sqrt(rot_stiff_) * Matrix3d::Identity();
+
+    desired_rotation_.setIdentity();
+
+    CartesianArray init{};
+    init.fill(0.0);
+    xdot_cmd_buffer_.writeFromNonRT(init);
+    wrench_cmd_buffer_.writeFromNonRT(init);
+
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+
+    remote_state_sub_ =
+        get_node()->create_subscription<geo_gp_interfaces::msg::TDPACartesianState>(
+            remote_state_topic_, qos,
+            std::bind(&CartesianImpedanceController::remoteStateCallback, this,
+                      std::placeholders::_1));
+
+    local_state_pub_raw_ =
+        get_node()->create_publisher<geo_gp_interfaces::msg::TDPACartesianState>(
+            local_state_topic_, qos);
+
+    local_state_pub_ =
+        std::make_unique<
+            realtime_tools::RealtimePublisher<geo_gp_interfaces::msg::TDPACartesianState>>(
+            local_state_pub_raw_);
+
+    tdpaReset_();
+  } else {
+    sub_leader_robot_state_ =
+        get_node()->create_subscription<franka_msgs::msg::FrankaState>(
+            leader_robot_state_topic_, rclcpp::QoS(1),
+            std::bind(&CartesianImpedanceController::leaderRobotStateCallback, this,
+                      std::placeholders::_1));
+
+    sub_execution_pose_ =
+        get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+            execution_pose_topic_, rclcpp::QoS(10),
+            std::bind(&CartesianImpedanceController::executionDesiredPoseCallback, this,
+                      std::placeholders::_1));
+
+    sub_execution_running_ =
+        get_node()->create_subscription<std_msgs::msg::Bool>(
+            execution_running_topic_, rclcpp::QoS(1).transient_local(),
+            std::bind(&CartesianImpedanceController::executionRunningCallback, this,
+                      std::placeholders::_1));
+
+    pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
+        blend_running_topic_, rclcpp::QoS(1).transient_local());
+  }
+
   return CallbackReturn::SUCCESS;
 }
 
@@ -398,7 +865,15 @@ CallbackReturn
 CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previous_state*/) {
   accept_desired_.store(false, std::memory_order_release);
 
+  if (TDPA_active_) {
+    updateJointStates();
+  }
+
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
+
+  if (TDPA_active_) {
+    franka_robot_state_->assign_loaned_state_interfaces(state_interfaces_);
+  }
 
   Eigen::Map<const Matrix4d> desired_init(
       franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
@@ -424,31 +899,60 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
 
   desired_qn_ = Vector7d(franka_robot_model_->getRobotState()->q.data());
 
-  prev_execution_running_ = false;
-  execution_running_.store(false, std::memory_order_release);
-  pending_blend_to_leader_.store(false, std::memory_order_release);
-  blending_to_leader_.store(false, std::memory_order_release);
-  blend_running_hold_until_ = this->get_node()->now();
-  last_blend_running_published_ = false;
-  if (pub_blend_running_) {
-    std_msgs::msg::Bool m;
-    m.data = false;
-    pub_blend_running_->publish(m);
+  if (TDPA_active_) {
+    position_start_ = init_pos;
+    orientation_start_ = init_ori;
+    desired_position_ = position_start_;
+    desired_orientation_ = orientation_start_;
+    desired_rotation_ = orientation_start_.toRotationMatrix();
+
+    CartesianArray init_arr{};
+    init_arr.fill(0.0);
+    xdot_cmd_buffer_.writeFromNonRT(init_arr);
+    wrench_cmd_buffer_.writeFromNonRT(init_arr);
+
+    last_desired_seq_ = desired_seq_.load(std::memory_order_acquire);
+
+    pandatime_ = 0.0;
+    remote_pandatime_ = 0.0;
+    local_seq_ = 0;
+    last_received_remote_seq_ = 0;
+    last_received_remote_tx_time_ns_ = 0;
+
+    tdpaReset_();
+
+    last_tau_cmd_.setZero();
+    last_tau_cmd_initialized_ = false;
+    wrench_applied_.setZero();
+    wrench_applied_initialized_ = false;
+  } else {
+    prev_execution_running_ = false;
+    execution_running_.store(false, std::memory_order_release);
+    pending_blend_to_leader_.store(false, std::memory_order_release);
+    blending_to_leader_.store(false, std::memory_order_release);
+    blend_running_hold_until_ = this->get_node()->now();
+    last_blend_running_published_ = false;
+    if (pub_blend_running_) {
+      std_msgs::msg::Bool m;
+      m.data = false;
+      pub_blend_running_->publish(m);
+    }
+
+    stiffness_.setIdentity();
+    stiffness_.topLeftCorner(3, 3) = pos_stiff_ * Matrix3d::Identity();
+    stiffness_.bottomRightCorner(3, 3) = rot_stiff_ * Matrix3d::Identity();
+
+    damping_.setIdentity();
+    damping_.topLeftCorner(3, 3) = 2.0 * std::sqrt(pos_stiff_) * Matrix3d::Identity();
+    damping_.bottomRightCorner(3, 3) = 0.8 * 2.0 * std::sqrt(rot_stiff_) * Matrix3d::Identity();
   }
-
-  stiffness_.setIdentity();
-  stiffness_.topLeftCorner(3, 3) = pos_stiff_ * Matrix3d::Identity();
-  stiffness_.bottomRightCorner(3, 3) = rot_stiff_ * Matrix3d::Identity();
-
-  damping_.setIdentity();
-  damping_.topLeftCorner(3, 3) = 2.0 * std::sqrt(pos_stiff_) * Matrix3d::Identity();
-  damping_.bottomRightCorner(3, 3) = 0.8 * 2.0 * std::sqrt(rot_stiff_) * Matrix3d::Identity();
 
   dq_filtered_.setZero();
 
   if (move_to_start_) {
-    Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
-    motion_generator_ = std::make_unique<MotionGenerator>(0.2, q, q_start_);
+    const Vector7d q_init = TDPA_active_ ? q_
+                                         : Vector7d(franka_robot_model_->getRobotState()->q.data());
+    motion_generator_ = std::make_unique<MotionGenerator>(0.2, q_init, q_start_);
     start_time_ = this->get_node()->now();
     mode_.store(static_cast<uint8_t>(Mode::MOVE_TO_START), std::memory_order_release);
     // accept_desired stays false until finished
@@ -469,7 +973,50 @@ CartesianImpedanceController::on_deactivate(const rclcpp_lifecycle::State& /*pre
     pub_blend_running_->publish(m);
   }
   franka_robot_model_->release_interfaces();
+  if (franka_robot_state_) {
+    franka_robot_state_->release_interfaces();
+  }
   return CallbackReturn::SUCCESS;
+}
+
+void CartesianImpedanceController::remoteStateCallback(
+    const geo_gp_interfaces::msg::TDPACartesianState& msg) {
+  if (!accept_desired_.load(std::memory_order_relaxed) &&
+      static_cast<Mode>(mode_.load(std::memory_order_relaxed)) != Mode::CARTESIAN) {
+    return;
+  }
+
+  remote_pandatime_ = msg.pandatime;
+
+  last_received_remote_seq_ = msg.seq;
+  last_received_remote_tx_time_ns_ = msg.tx_time_ns;
+
+  CartesianArray xdot_remote_arr{};
+  CartesianArray wrench_remote_arr{};
+
+  xdot_remote_arr.fill(0.0);
+  wrench_remote_arr.fill(0.0);
+
+  for (int i = 0; i < cart_dims; ++i) {
+    x_remote_delta_(i) = msg.x_local_delta[static_cast<size_t>(i)];
+    xdot_remote_arr[static_cast<size_t>(i)] = msg.xdot_local[static_cast<size_t>(i)];
+    wrench_remote_arr[static_cast<size_t>(i)] = msg.wrench_local[static_cast<size_t>(i)];
+  }
+
+  xdot_cmd_buffer_.writeFromNonRT(xdot_remote_arr);
+  wrench_cmd_buffer_.writeFromNonRT(wrench_remote_arr);
+
+  desired_seq_.fetch_add(1, std::memory_order_release);
+
+  if (std::isfinite(msg.energy_linear)) {
+    E_L_in_delayed_linear_ = msg.energy_linear;
+  }
+
+  if (std::isfinite(msg.energy_rotational)) {
+    E_L_in_delayed_rotational_ = msg.energy_rotational;
+  }
+
+  E_L_in_delayed_ = E_L_in_delayed_linear_ + E_L_in_delayed_rotational_;
 }
 
 void CartesianImpedanceController::leaderRobotStateCallback(

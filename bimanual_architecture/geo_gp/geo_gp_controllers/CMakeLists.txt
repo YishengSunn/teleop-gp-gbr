@@ -21,6 +21,7 @@ find_package(franka_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(realtime_tools REQUIRED)
+find_package(geo_gp_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(
@@ -31,6 +32,8 @@ add_library(
   src/subscriber/hybrid_position_force_controller.cpp
   src/subscriber/joint_impedance_controller.cpp
   src/subscriber/gravity_compensation_with_joint_torque_feedback_controller.cpp
+  src/tdpa/cartesian.cpp
+  src/tdpa/joint.cpp
 )
 
 target_include_directories(
@@ -52,6 +55,12 @@ ament_target_dependencies(
   sensor_msgs
   std_msgs
   realtime_tools
+  geo_gp_interfaces
+)
+
+target_link_libraries(
+  ${PROJECT_NAME}
+  geo_gp_interfaces::geo_gp_interfaces__rosidl_typesupport_cpp
 )
 
 pluginlib_export_plugin_description_file(
@@ -101,6 +110,7 @@ ament_export_dependencies(
   sensor_msgs
   std_msgs
   realtime_tools
+  geo_gp_interfaces
 )
 
 ament_package()

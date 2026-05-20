@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint64 seq
+int64 tx_time_ns
+uint64 echo_seq
+int64 echo_tx_time_ns
+float64 pandatime
+float64[6] x_local_delta
+float64[6] xdot_local
+float64[6] wrench_local
+float64 energy
+float64 energy_linear
+float64 energy_rotational

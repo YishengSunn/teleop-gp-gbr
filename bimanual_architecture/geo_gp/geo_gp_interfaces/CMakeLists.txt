@@ -21,6 +21,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PromptTrajectory.msg"
   "msg/PredictedTrajectory.msg"
   "msg/SkillMatchResult.msg"
+  "msg/TDPAJointState.msg"
+  "msg/TDPACartesianState.msg"
 
   "srv/ResetPrediction.srv"
   "srv/ReloadSkills.srv"
