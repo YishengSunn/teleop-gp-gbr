@@ -352,6 +352,11 @@ follower:
     ros__parameters:
       arm_id: follower
       leader_robot_state_topic: /leader/franka_robot_state_broadcaster/robot_state
+
+      # Gains for the move-to-start controller
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
       
       # Stiffness and damping for the Cartesian impedance controller
       pos_stiff: 600.0
@@ -382,6 +387,11 @@ follower:
     ros__parameters:
       arm_id: follower
       leader_robot_state_topic: /leader/franka_robot_state_broadcaster/robot_state
+
+      # Gains for the move-to-start controller
+      move_to_start: true
+      start_k_gains: [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]
+      start_d_gains: [30.0, 30.0, 30.0, 10.0, 10.0, 10.0, 5.0]
 
       # Stiffness and damping for the hybrid position force controller
       pos_stiff: 500.0
