@@ -32,6 +32,7 @@ add_library(
   src/subscriber/hybrid_position_force_controller.cpp
   src/subscriber/joint_impedance_controller.cpp
   src/subscriber/gravity_compensation_with_joint_torque_feedback_controller.cpp
+  src/subscriber/gravity_compensation_with_cartesian_force_feedback_controller.cpp
   src/tdpa/cartesian.cpp
   src/tdpa/joint.cpp
 )

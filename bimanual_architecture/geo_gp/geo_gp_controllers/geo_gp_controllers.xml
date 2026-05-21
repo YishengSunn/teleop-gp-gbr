@@ -38,4 +38,12 @@
       Gravity compensation with joint torque feedback.
     </description>
   </class>
+
+  <class name="geo_gp_controllers/GravityCompensationWithCartesianForceFeedbackController"
+         type="geo_gp_controllers::GravityCompensationWithCartesianForceFeedbackController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Gravity compensation with Cartesian TDPA force feedback for leader teleop.
+    </description>
+  </class>
 </library>

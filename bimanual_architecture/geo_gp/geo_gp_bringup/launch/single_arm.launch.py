@@ -164,7 +164,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['gravity_compensation_with_joint_torque_feedback_controller', '--controller-manager', cm_abs],
+            arguments=['gravity_compensation_with_cartesian_force_feedback_controller', '--controller-manager', cm_abs],
             namespace=ns,
             output='screen',
             condition=IfCondition(
