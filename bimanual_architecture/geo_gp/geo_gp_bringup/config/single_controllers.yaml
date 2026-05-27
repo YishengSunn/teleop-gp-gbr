@@ -166,11 +166,11 @@ leader:
       tau_ext_feedback: true
       k_pos_drift: 0.0
       eta_passivity_shortage: 0.0
-      remote_state_topic: /follower/tdpa_joint_state
+      remote_state_topic: /follower/tdpa_joint_state_delayed
       local_state_topic: /leader/tdpa_joint_state
 
       # Non-TDPA haptic feedback path. When TDPA_active is true, feedback is carried by
-      # /follower/tdpa_joint_state and the torque topic settings below are ignored.
+      # /follower/tdpa_joint_state_delayed and the torque topic settings below are ignored.
       feedback_source: "measured"  # measured: external torque estimate; commanded: controller torque
       torque_feedback_topic: ""    # Empty selects the topic from feedback_source; non-empty overrides
 
@@ -199,11 +199,11 @@ leader:
       tau_ext_feedback: true
       k_pos_drift: 0.0
       eta_passivity_shortage: 0.0
-      remote_state_topic: /follower/tdpa_cartesian_state
+      remote_state_topic: /follower/tdpa_cartesian_state_delayed
       local_state_topic: /leader/tdpa_cartesian_state
 
       # Non-TDPA haptic feedback path. When TDPA_active is true, feedback is carried by
-      # /follower/tdpa_cartesian_state and the torque topic settings below are ignored.
+      # /follower/tdpa_cartesian_state_delayed and the torque topic settings below are ignored.
       feedback_source: "measured"  # measured: external torque estimate; commanded: controller torque
       torque_feedback_topic: ""    # Empty selects the topic from feedback_source; non-empty overrides
 
@@ -375,7 +375,7 @@ follower:
       tau_ext_feedback: true
       k_pos_drift: 0.0
       eta_passivity_shortage: 0.0
-      remote_state_topic: /leader/tdpa_joint_state
+      remote_state_topic: /leader/tdpa_joint_state_delayed
       local_state_topic: /follower/tdpa_joint_state
 
       # Gains for the move-to-start controller
@@ -402,7 +402,7 @@ follower:
       tau_ext_feedback: true
       k_pos_drift: 0.0
       eta_passivity_shortage: 0.0
-      remote_state_topic: /leader/tdpa_cartesian_state
+      remote_state_topic: /leader/tdpa_cartesian_state_delayed
       local_state_topic: /follower/tdpa_cartesian_state
 
       # Topics for executing and blending to the leader
@@ -438,7 +438,7 @@ follower:
       tau_ext_feedback: true
       k_pos_drift: 0.0
       eta_passivity_shortage: 0.0
-      remote_state_topic: /leader/tdpa_cartesian_state
+      remote_state_topic: /leader/tdpa_cartesian_state_delayed
       local_state_topic: /follower/tdpa_cartesian_state
 
       # Topics for executing and blending to the leader

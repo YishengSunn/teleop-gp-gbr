@@ -35,6 +35,7 @@ def generate_launch_description():
     ns_parameter_name = 'ns'
     move_to_start_parameter_name = 'move_to_start'
     control_mode_parameter_name = 'control_mode'
+    tdpa_delay_ms_parameter_name = 'tdpa_delay_ms'
 
     robot_ip = LaunchConfiguration(robot_ip_parameter_name)
     arm_id = LaunchConfiguration(arm_id_parameter_name)
@@ -46,6 +47,7 @@ def generate_launch_description():
     control_mode = LaunchConfiguration(control_mode_parameter_name)
 
     ns = LaunchConfiguration(ns_parameter_name)
+    tdpa_delay_ms = LaunchConfiguration(tdpa_delay_ms_parameter_name)
     cm_abs = [TextSubstitution(text='/'), ns, TextSubstitution(text='/controller_manager')]
 
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'real',
@@ -101,6 +103,10 @@ def generate_launch_description():
             control_mode_parameter_name,
             default_value='joint_impedance',
             description='Control mode'),
+        DeclareLaunchArgument(
+            tdpa_delay_ms_parameter_name,
+            default_value='0.0',
+            description='Delay applied to leader/follower TDPA topics in milliseconds'),
 
         Node(
             package='robot_state_publisher',
@@ -133,6 +139,74 @@ def generate_launch_description():
             },
             namespace=ns,
             on_exit=Shutdown(),
+        ),
+        Node(
+            package='geo_gp_controllers',
+            executable='tdpa_delay_relay',
+            name='follower_cartesian_tdpa_delay_relay',
+            output='screen',
+            parameters=[{
+                'message_type': 'cartesian',
+                'input_topic': '/follower/tdpa_cartesian_state',
+                'output_topic': '/follower/tdpa_cartesian_state_delayed',
+                'delay_ms': tdpa_delay_ms,
+            }],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", ns, "' == 'leader' and '", move_to_start, "' == 'false'"
+                ]),
+            ),
+        ),
+        Node(
+            package='geo_gp_controllers',
+            executable='tdpa_delay_relay',
+            name='follower_joint_tdpa_delay_relay',
+            output='screen',
+            parameters=[{
+                'message_type': 'joint',
+                'input_topic': '/follower/tdpa_joint_state',
+                'output_topic': '/follower/tdpa_joint_state_delayed',
+                'delay_ms': tdpa_delay_ms,
+            }],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", ns, "' == 'leader' and '", move_to_start, "' == 'false'"
+                ]),
+            ),
+        ),
+        Node(
+            package='geo_gp_controllers',
+            executable='tdpa_delay_relay',
+            name='leader_cartesian_tdpa_delay_relay',
+            output='screen',
+            parameters=[{
+                'message_type': 'cartesian',
+                'input_topic': '/leader/tdpa_cartesian_state',
+                'output_topic': '/leader/tdpa_cartesian_state_delayed',
+                'delay_ms': tdpa_delay_ms,
+            }],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", ns, "' == 'follower' and '", move_to_start, "' == 'false'"
+                ]),
+            ),
+        ),
+        Node(
+            package='geo_gp_controllers',
+            executable='tdpa_delay_relay',
+            name='leader_joint_tdpa_delay_relay',
+            output='screen',
+            parameters=[{
+                'message_type': 'joint',
+                'input_topic': '/leader/tdpa_joint_state',
+                'output_topic': '/leader/tdpa_joint_state_delayed',
+                'delay_ms': tdpa_delay_ms,
+            }],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", ns, "' == 'follower' and '", move_to_start, "' == 'false'"
+                ]),
+            ),
         ),
         Node(
             package='controller_manager',

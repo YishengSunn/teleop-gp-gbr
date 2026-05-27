@@ -64,6 +64,13 @@ target_link_libraries(
   geo_gp_interfaces::geo_gp_interfaces__rosidl_typesupport_cpp
 )
 
+add_executable(tdpa_delay_relay src/tdpa/tdpa_delay_relay.cpp)
+ament_target_dependencies(
+  tdpa_delay_relay
+  rclcpp
+  geo_gp_interfaces
+)
+
 pluginlib_export_plugin_description_file(
   controller_interface geo_gp_controllers.xml
 )
@@ -73,6 +80,11 @@ install(
   RUNTIME DESTINATION bin
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
+)
+
+install(
+  TARGETS tdpa_delay_relay
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
