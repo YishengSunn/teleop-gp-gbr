@@ -256,7 +256,7 @@ class Predictor:
 
         # 2) Skill matching
         t_match_start = time.perf_counter()
-        skill, (R, s, t, j_end) = self.skill_library.match(probe_eq, margin_pts=30, step=1)
+        skill, (R, s, t, j_end) = self.skill_library.match(probe_eq, margin_pts=1000, step=15)
         match_ms = (time.perf_counter() - t_match_start) * 1000.0
 
         ref_eq = skill.ref_eq
@@ -526,7 +526,6 @@ class Predictor:
         for idx, chunk_h in enumerate(chunk_sizes, start=1):
             t_chunk_start = time.perf_counter()
             reached_goal_in_chunk = False
-            hist_len = cur_pos.shape[0]
             tp = torch.tensor(cur_pos, dtype=torch.float32)
             tq = torch.tensor(cur_quat, dtype=torch.float32)
             tf = None if cur_force is None else torch.tensor(cur_force, dtype=torch.float32)
@@ -569,15 +568,14 @@ class Predictor:
                 self.logger.info("[Predict] Empty chunk prediction, stopping progressive rollout")
                 break
 
-            ref_tail_start = min(hist_len, len(ref_eq))
-            ref_tail = ref_eq[ref_tail_start:]
-            compare_len = min(len(preds_ref_pos_np), len(ref_tail))
-            if compare_len <= 0:
-                self.logger.info("[GeomCheck] No valid reference tail for chunk check, stop")
+            total_preds_ref = np.vstack([cur_pos, preds_ref_pos_np])
+            compare_len = min(len(total_preds_ref), len(ref_eq))
+            if (total_preds_ref.shape[0] > ref_eq.shape[0] + 500):
+                self.logger.info("Chunk prediction is too long, stopping progressive rollout")
                 break
             mse_chunk = geom_mse(
-                preds_ref_pos_np[:compare_len],
-                ref_tail[:compare_len],
+                total_preds_ref,
+                ref_eq[:compare_len],
                 compare_len,
             )
             self.logger.info(f"[GeomCheck] chunk mse = {mse_chunk:.5f} (len={compare_len})")
