@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import sys
 import time
@@ -22,6 +24,105 @@ from utils.misc import (
 )
 
 
+def save_predicted_trajectory_to_csv(filepath: str, pred: PredictedTrajectory) -> None:
+    """
+    Save a predicted trajectory to a CSV file.
+
+    Args:
+        filepath (str): The path to the CSV file to save the predicted trajectory to.
+        pred (PredictedTrajectory): The predicted trajectory to save.
+    """
+    has_force = len(pred.forces) == len(pred.poses) and len(pred.poses) > 0
+    header = ["time", "x", "y", "z", "qx", "qy", "qz", "qw"]
+    if has_force:
+        header.extend(["fx", "fy", "fz"])
+
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for i, pose in enumerate(pred.poses):
+            t = pred.time_from_start[i] if i < len(pred.time_from_start) else float(i)
+            row = [
+                round(float(t), 4),
+                round(float(pose.position.x), 6),
+                round(float(pose.position.y), 6),
+                round(float(pose.position.z), 6),
+                round(float(pose.orientation.x), 6),
+                round(float(pose.orientation.y), 6),
+                round(float(pose.orientation.z), 6),
+                round(float(pose.orientation.w), 6),
+            ]
+            if has_force:
+                force = pred.forces[i]
+                row.extend([
+                    round(float(force.x), 6),
+                    round(float(force.y), 6),
+                    round(float(force.z), 6),
+                ])
+            writer.writerow(row)
+
+
+def save_prompt_trajectory_to_csv(filepath: str, prompt: PromptTrajectory) -> None:
+    """
+    Save a prompt trajectory to a CSV file.
+
+    Args:
+        filepath (str): The path to the CSV file to save the prompt trajectory to.
+        prompt (PromptTrajectory): The prompt trajectory to save.
+    """
+    has_force = len(prompt.forces) == len(prompt.poses) and len(prompt.poses) > 0
+    header = ["time", "x", "y", "z", "qx", "qy", "qz", "qw"]
+    if has_force:
+        header.extend(["fx", "fy", "fz"])
+
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for i, pose in enumerate(prompt.poses):
+            t = prompt.time_from_start[i] if i < len(prompt.time_from_start) else float(i)
+            row = [
+                round(float(t), 4),
+                round(float(pose.position.x), 6),
+                round(float(pose.position.y), 6),
+                round(float(pose.position.z), 6),
+                round(float(pose.orientation.x), 6),
+                round(float(pose.orientation.y), 6),
+                round(float(pose.orientation.z), 6),
+                round(float(pose.orientation.w), 6),
+            ]
+            if has_force:
+                force = prompt.forces[i]
+                row.extend([
+                    round(float(force.x), 6),
+                    round(float(force.y), 6),
+                    round(float(force.z), 6),
+                ])
+            writer.writerow(row)
+
+
+def save_similarity_transform_to_json(filepath: str, ctx: dict) -> None:
+    """
+    Save skill-matching similarity transform (R, s, t) and related metadata to JSON.
+
+    Args:
+        filepath (str): The path to the JSON file to save the similarity transform to.
+        ctx (dict): The context dictionary containing the similarity transform and related metadata.
+    """
+    R = np.asarray(ctx["R"], dtype=np.float64)
+    t_vec = np.asarray(ctx["t"], dtype=np.float64).reshape(-1)
+    payload = {
+        "skill_name": ctx["skill"].name,
+        "match_ms": round(float(ctx["match_ms"]), 3),
+        "j_end": int(ctx["j_end"]),
+        "s": round(float(ctx["s"]), 8),
+        "t": [round(float(v), 8) for v in t_vec.tolist()],
+        "R": [[round(float(v), 8) for v in row] for row in R.tolist()],
+    }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
 class Predictor:
     def __init__(self, logger, config_path, model_dir):
         # Load config
@@ -37,6 +138,7 @@ class Predictor:
         self.max_start_jump = self.cfg.prediction["max_start_jump"]
         self.drop_k = self.cfg.prediction["drop_k"]
         self.max_retries = self.cfg.prediction["max_retries"]
+        self.last_prediction_context = None
 
         # Logger
         self.logger = logger
@@ -235,6 +337,7 @@ class Predictor:
             probe_force_eq = None
 
         if len(probe_eq) < (self.k + 2):
+            self.last_prediction_context = {"ok": False}
             return {
                 "ok": False,
                 "predicted": self.numpy_to_predicted(
@@ -267,7 +370,7 @@ class Predictor:
         # 3) Transform to ref frame
         probe_in_ref = ((probe_eq - t) / s) @ R
         probe_goal = s * (ref_eq[-1] @ R.T) + t
-        return {
+        self.last_prediction_context = {
             "ok": True,
             "prompt_msg": prompt_msg,
             "target_speed": target_speed,
@@ -278,6 +381,7 @@ class Predictor:
             "R": R,
             "s": s,
             "t": t,
+            "j_end": int(j_end),
             "ref_eq": ref_eq,
             "probe_eq": probe_eq,
             "probe_quat_eq": probe_quat_eq,
@@ -285,6 +389,7 @@ class Predictor:
             "probe_in_ref": probe_in_ref,
             "probe_goal": probe_goal,
         }
+        return self.last_prediction_context.copy()
 
     def predict_from_context(self, ctx, rollout_horizon_override=None):
         t_predict_start = time.perf_counter()

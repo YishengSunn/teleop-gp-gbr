@@ -32,6 +32,8 @@ def generate_launch_description():
                 "execution_running_topic": "/execution/running",
                 "enabled_topic": "/geo_gp/enabled",
                 "force_enabled_topic": "/geo_gp/force_prediction_enabled",
+                "save_csv": True,
+                "csv_output_dir": "/home/user/geo-gp/data/05-08/predictions/line1",
             }]
         ),
         Node(
