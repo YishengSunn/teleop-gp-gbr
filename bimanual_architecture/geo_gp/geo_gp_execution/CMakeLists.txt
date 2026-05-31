@@ -11,11 +11,15 @@ find_package(rclcpp REQUIRED)
 find_package(geo_gp_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(franka_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 # include
 include_directories(include)
 
 add_executable(trajectory_executor src/trajectory_executor.cpp)
+
+target_include_directories(trajectory_executor PRIVATE ${EIGEN3_INCLUDE_DIR})
 
 # link dependencies
 ament_target_dependencies(trajectory_executor
@@ -23,6 +27,8 @@ ament_target_dependencies(trajectory_executor
   geo_gp_interfaces
   geometry_msgs
   std_msgs
+  franka_msgs
+  Eigen3
 )
 
 # install

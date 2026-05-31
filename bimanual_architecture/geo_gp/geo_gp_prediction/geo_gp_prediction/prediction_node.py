@@ -179,15 +179,18 @@ class PredictionNode(Node):
             f"Geo-GP force prediction {'ENABLED' if msg.data else 'DISABLED'}"
         )
 
-    def _make_output_paths(self) -> dict:
+    def _make_output_paths(self, success: bool) -> dict:
         output_dir = self._csv_output_dir or os.getcwd()
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        status = "success" if success else "failed"
         return {
-            "prediction": os.path.join(output_dir, f"prediction_{timestamp}.csv"),
-            "prompt": os.path.join(output_dir, f"prompt_{timestamp}.csv"),
+            "prediction": os.path.join(
+                output_dir, f"prediction_{status}_{timestamp}.csv"
+            ),
+            "prompt": os.path.join(output_dir, f"prompt_{status}_{timestamp}.csv"),
             "similarity_transform": os.path.join(
-                output_dir, f"similarity_transform_{timestamp}.json"
+                output_dir, f"similarity_transform_{status}_{timestamp}.json"
             ),
         }
 
@@ -198,18 +201,19 @@ class PredictionNode(Node):
         prompt_msg: PromptTrajectory,
         seq: int,
     ) -> None:
-        if not self._save_csv or not pred.success or len(pred.poses) == 0:
+        if not self._save_csv:
             return
 
         ctx = self.predictor.last_prediction_context
         try:
-            save_predicted_trajectory_to_csv(paths["prediction"], pred)
+            if len(pred.poses) > 0:
+                save_predicted_trajectory_to_csv(paths["prediction"], pred)
             save_prompt_trajectory_to_csv(paths["prompt"], prompt_msg)
             if ctx is not None and ctx.get("ok"):
                 save_similarity_transform_to_json(paths["similarity_transform"], ctx)
             self.get_logger().info(
                 "Saved prediction artifacts | "
-                f"seq={seq} | poses={len(pred.poses)} | "
+                f"seq={seq} | success={pred.success} | poses={len(pred.poses)} | "
                 f"prediction={paths['prediction']} | prompt={paths['prompt']}"
                 + (
                     f" | transform={paths['similarity_transform']}"
@@ -248,14 +252,14 @@ class PredictionNode(Node):
                 )
                 if self._progressive_publish:
                     published_any = False
-                    final_pred = None
-                    csv_paths = self._make_output_paths() if self._save_csv else None
+                    last_pred = None
                     for idx, total_chunks, pred_chunk in self.predictor.iter_progressive_predictions(
                         msg,
                         predict_force=force_enabled,
                         first_chunk_horizon=self._progressive_rollout_horizon,
                         rollout_step=self._progressive_rollout_step,
                     ):
+                        last_pred = pred_chunk
                         with self._lock:
                             enabled = self._enabled
                             execution_running = self._execution_running
@@ -281,14 +285,23 @@ class PredictionNode(Node):
                             )
                             continue
                         self.pred_pub.publish(pred_chunk)
-                        final_pred = pred_chunk
                         published_any = True
                         self.get_logger().info(
                             f"Published progressive chunk {idx}/{total_chunks} | seq={seq} "
                             f"| poses={len(pred_chunk.poses)}"
                         )
-                    if csv_paths is not None and final_pred is not None:
-                        self._save_prediction_artifacts(csv_paths, final_pred, msg, seq)
+                    if self._save_csv:
+                        pred_to_save = last_pred
+                        if pred_to_save is None:
+                            pred_to_save = self.predictor.predict(
+                                msg, predict_force=force_enabled
+                            )
+                        self._save_prediction_artifacts(
+                            self._make_output_paths(pred_to_save.success),
+                            pred_to_save,
+                            msg,
+                            seq,
+                        )
                     continue
 
                 pred = self.predictor.predict(msg, predict_force=force_enabled)
@@ -310,7 +323,7 @@ class PredictionNode(Node):
                 self.pred_pub.publish(pred)
                 if self._save_csv:
                     self._save_prediction_artifacts(
-                        self._make_output_paths(), pred, msg, seq
+                        self._make_output_paths(pred.success), pred, msg, seq
                     )
                 self.get_logger().info(
                     f"Published predicted trajectory | seq={seq} | success={pred.success} | "

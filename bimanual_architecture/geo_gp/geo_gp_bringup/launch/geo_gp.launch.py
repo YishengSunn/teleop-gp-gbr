@@ -26,14 +26,14 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 "config_path": "/home/user/geo-gp/config/default.yaml",
-                "model_dir": "/home/user/geo-gp/data/05-08/models/6d/line1",
+                "model_dir": "/home/user/geo-gp/data/05-08/models/6d/arc1",
                 "input_topic": "/gp_prompt_trajectory",
                 "output_topic": "/gp_predicted_trajectory",
                 "execution_running_topic": "/execution/running",
                 "enabled_topic": "/geo_gp/enabled",
                 "force_enabled_topic": "/geo_gp/force_prediction_enabled",
-                "save_csv": True,
-                "csv_output_dir": "/home/user/geo-gp/data/05-08/predictions/line1",
+                "save_csv": False,
+                "csv_output_dir": "/home/user/geo-gp/data/05-08/preds/arc1/arc1_1",
             }]
         ),
         Node(
@@ -47,6 +47,9 @@ def generate_launch_description():
                 "force_output_topic": "/execution/desired_force",
                 "force_axis": "z",
                 "running_topic": "/execution/running",
+                "leader_input_topic": "/leader/franka_robot_state_broadcaster/robot_state",
+                "save_leader_csv": False,
+                "csv_output_dir": "/home/user/geo-gp/data/05-08/preds/arc1/arc1_1",
             }]
         )
     ])

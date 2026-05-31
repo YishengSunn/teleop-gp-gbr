@@ -1,6 +1,11 @@
 #include "geo_gp_execution/trajectory_executor.hpp"
 
 #include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 using std::placeholders::_1;
 using namespace std::chrono_literals;
@@ -11,12 +16,18 @@ void publish_running(const rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr& pu
   msg.data = running;
   pub->publish(msg);
 }
+
+double round_to(double value, int precision) {
+  const double scale = std::pow(10.0, precision);
+  return std::round(value * scale) / scale;
+}
 }  // namespace
 
 TrajectoryExecutor::TrajectoryExecutor()
 : Node("trajectory_executor"),
   index_(0),
-  executing_(false) {
+  executing_(false),
+  recording_leader_(false) {
 
     input_topic_ = this->declare_parameter<std::string>(
         "input_topic", "/gp_predicted_trajectory");
@@ -28,6 +39,12 @@ TrajectoryExecutor::TrajectoryExecutor()
         "force_axis", "z");
     running_topic_ = this->declare_parameter<std::string>(
         "running_topic", "/execution/running");
+    leader_input_topic_ = this->declare_parameter<std::string>(
+        "leader_input_topic", "/leader/franka_robot_state_broadcaster/robot_state");
+    csv_output_dir_ = this->declare_parameter<std::string>(
+        "csv_output_dir", "");
+    save_leader_csv_ = this->declare_parameter<bool>(
+        "save_leader_csv", true);
     publish_rate_ = this->declare_parameter<double>(
         "rate", 200.0);
     progressive_update_enabled_ = this->declare_parameter<bool>(
@@ -40,6 +57,11 @@ TrajectoryExecutor::TrajectoryExecutor()
     sub_ = this->create_subscription<geo_gp_interfaces::msg::PredictedTrajectory>(
         input_topic_, 10,
         std::bind(&TrajectoryExecutor::trajectory_callback, this, _1)
+    );
+
+    leader_state_sub_ = this->create_subscription<franka_msgs::msg::FrankaState>(
+        leader_input_topic_, rclcpp::QoS(10),
+        std::bind(&TrajectoryExecutor::leader_state_callback, this, _1)
     );
 
     pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
@@ -60,8 +82,142 @@ TrajectoryExecutor::TrajectoryExecutor()
     );
 
     RCLCPP_INFO(this->get_logger(), "Trajectory Executor started.");
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Leader recording: %s | topic=%s | csv_output_dir=%s",
+        save_leader_csv_ ? "enabled" : "disabled",
+        leader_input_topic_.c_str(),
+        csv_output_dir_.empty() ? "(cwd)" : csv_output_dir_.c_str());
 
     publish_running(pub_running_, false);
+}
+
+std::string TrajectoryExecutor::format_execution_timestamp(const rclcpp::Time & stamp) {
+    const int64_t nanoseconds = stamp.nanoseconds();
+    const int64_t seconds = nanoseconds / 1000000000LL;
+
+    std::time_t time_sec = static_cast<std::time_t>(seconds);
+    std::tm tm_local{};
+#if defined(_WIN32)
+    localtime_s(&tm_local, &time_sec);
+#else
+    localtime_r(&time_sec, &tm_local);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_local, "%Y-%m-%d_%H-%M-%S");
+    return oss.str();
+}
+
+void TrajectoryExecutor::begin_leader_recording(const std::string & skill_name) {
+    if (!save_leader_csv_) {
+        return;
+    }
+
+    leader_samples_.clear();
+    recording_skill_name_ = skill_name;
+    recording_timestamp_ = format_execution_timestamp(start_time_);
+    recording_leader_ = true;
+}
+
+void TrajectoryExecutor::save_leader_trajectory_csv() {
+    if (!save_leader_csv_ || leader_samples_.empty()) {
+        return;
+    }
+
+    std::filesystem::path output_dir = csv_output_dir_.empty()
+        ? std::filesystem::current_path()
+        : std::filesystem::path(csv_output_dir_);
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Failed to create leader CSV output directory '%s': %s",
+            output_dir.string().c_str(),
+            ec.message().c_str());
+        return;
+    }
+
+    const std::string filename =
+        "leader_execution_" + recording_timestamp_ + ".csv";
+    const std::filesystem::path filepath = output_dir / filename;
+
+    std::ofstream out(filepath);
+    if (!out.is_open()) {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Failed to open leader CSV file '%s'",
+            filepath.string().c_str());
+        return;
+    }
+
+    out << "time,x,y,z,qx,qy,qz,qw,fx,fy,fz\n";
+    out << std::fixed;
+    for (const auto & sample : leader_samples_) {
+        const auto & pose = sample.pose;
+        const auto & force = sample.force;
+        out << round_to(sample.time, 4) << ","
+            << round_to(pose.position.x, 6) << ","
+            << round_to(pose.position.y, 6) << ","
+            << round_to(pose.position.z, 6) << ","
+            << round_to(pose.orientation.x, 6) << ","
+            << round_to(pose.orientation.y, 6) << ","
+            << round_to(pose.orientation.z, 6) << ","
+            << round_to(pose.orientation.w, 6) << ","
+            << round_to(force.x, 6) << ","
+            << round_to(force.y, 6) << ","
+            << round_to(force.z, 6) << "\n";
+    }
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Saved leader execution trajectory | skill=%s | samples=%zu | file=%s",
+        recording_skill_name_.c_str(),
+        leader_samples_.size(),
+        filepath.string().c_str());
+}
+
+void TrajectoryExecutor::finalize_leader_recording() {
+    if (!recording_leader_) {
+        return;
+    }
+
+    save_leader_trajectory_csv();
+    leader_samples_.clear();
+    recording_leader_ = false;
+    recording_skill_name_.clear();
+    recording_timestamp_.clear();
+}
+
+void TrajectoryExecutor::leader_state_callback(
+    const franka_msgs::msg::FrankaState::SharedPtr msg) {
+    if (!executing_ || !recording_leader_) {
+        return;
+    }
+
+    const double elapsed = std::max(0.0, (this->now() - start_time_).seconds());
+
+    Eigen::Map<const Eigen::Matrix4d> T(msg->o_t_ee.data());
+
+    LeaderSample sample;
+    sample.time = elapsed;
+    sample.pose.position.x = T(0, 3);
+    sample.pose.position.y = T(1, 3);
+    sample.pose.position.z = T(2, 3);
+
+    Eigen::Quaterniond q(T.block<3, 3>(0, 0));
+    q.normalize();
+    sample.pose.orientation.x = q.x();
+    sample.pose.orientation.y = q.y();
+    sample.pose.orientation.z = q.z();
+    sample.pose.orientation.w = q.w();
+
+    sample.force.x = msg->o_f_ext_hat_k[0];
+    sample.force.y = msg->o_f_ext_hat_k[1];
+    sample.force.z = msg->o_f_ext_hat_k[2];
+
+    leader_samples_.push_back(sample);
 }
 
 void TrajectoryExecutor::trajectory_callback(
@@ -118,9 +274,14 @@ void TrajectoryExecutor::trajectory_callback(
         return;
     }
 
+    if (executing_) {
+        finalize_leader_recording();
+    }
+
     index_ = 0;
     executing_ = true;
     start_time_ = this->now();
+    begin_leader_recording(msg->skill_name);
     publish_running(pub_running_, true);
 }
 
@@ -142,6 +303,7 @@ void TrajectoryExecutor::timer_callback() {
             publish_force(force_trajectory_.back());
         }
         executing_ = false;
+        finalize_leader_recording();
         publish_running(pub_running_, false);
         RCLCPP_INFO(this->get_logger(),
             "Trajectory execution finished | elapsed=%.3f s",
