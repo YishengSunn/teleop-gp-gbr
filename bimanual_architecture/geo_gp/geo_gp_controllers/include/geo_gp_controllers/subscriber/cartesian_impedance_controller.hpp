@@ -93,20 +93,6 @@ private:
     E_F_in_ = 0.0;
     E_F_in_linear_ = 0.0;
     E_F_in_rotational_ = 0.0;
-
-    E_F_out_ = 0.0;
-    E_F_out_linear_ = 0.0;
-    E_F_out_rotational_ = 0.0;
-
-    E_F_diss_ = 0.0;
-    E_F_diss_linear_ = 0.0;
-    E_F_diss_rotational_ = 0.0;
-
-    beta_ = 0.0;
-    beta_linear_ = 0.0;
-    beta_rotational_ = 0.0;
-
-    shortage_ = 0.0;
     shortage_linear_ = 0.0;
     shortage_rotational_ = 0.0;
 
@@ -115,14 +101,10 @@ private:
     x_remote_delta_intgl_.setZero();
     xdot_local_.setZero();
     xdot_remote_.setZero();
-    wrench_remote_.setZero();
     wrench_ext_.setZero();
     wrench_c_.setZero();
-    wrench_c_no_mod_dq_.setZero();
-    wrench_diff_.setZero();
     wrench_applied_.setZero();
     wrench_applied_initialized_ = false;
-    x_des_.setZero();
     position_error_.setZero();
 
     tau_ext_.setZero();
@@ -186,14 +168,10 @@ private:
   Vector6d x_remote_delta_intgl_{Vector6d::Zero()};
   Vector6d xdot_local_{Vector6d::Zero()};
   Vector6d xdot_remote_{Vector6d::Zero()};
-  Vector6d wrench_remote_{Vector6d::Zero()};
   Vector6d wrench_ext_{Vector6d::Zero()};
   Vector6d wrench_c_{Vector6d::Zero()};
-  Vector6d wrench_c_no_mod_dq_{Vector6d::Zero()};
-  Vector6d wrench_diff_{Vector6d::Zero()};
   Vector6d wrench_applied_{Vector6d::Zero()};
   bool wrench_applied_initialized_{false};
-  Vector6d x_des_{Vector6d::Zero()};
   Vector6d position_error_{Vector6d::Zero()};
   Vector7d tau_ext_{Vector7d::Zero()};
   Vector7d last_tau_cmd_{Vector7d::Zero()};
@@ -211,16 +189,6 @@ private:
   double E_F_in_{0.0};
   double E_F_in_linear_{0.0};
   double E_F_in_rotational_{0.0};
-  double E_F_out_{0.0};
-  double E_F_out_linear_{0.0};
-  double E_F_out_rotational_{0.0};
-  double E_F_diss_{0.0};
-  double E_F_diss_linear_{0.0};
-  double E_F_diss_rotational_{0.0};
-  double beta_{0.0};
-  double beta_linear_{0.0};
-  double beta_rotational_{0.0};
-  double shortage_{0.0};
   double shortage_linear_{0.0};
   double shortage_rotational_{0.0};
 
@@ -232,7 +200,6 @@ private:
   CartesianTDPAFollower followerPC_rotational_;
 
   realtime_tools::RealtimeBuffer<CartesianArray> xdot_cmd_buffer_;
-  realtime_tools::RealtimeBuffer<CartesianArray> wrench_cmd_buffer_;
   std::atomic<uint64_t> desired_seq_{0};
   uint64_t last_desired_seq_{0};
 

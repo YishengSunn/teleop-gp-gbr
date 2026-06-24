@@ -225,7 +225,6 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
     CartesianArray cur{};
     cur.fill(0.0);
     xdot_cmd_buffer_.writeFromNonRT(cur);
-    wrench_cmd_buffer_.writeFromNonRT(cur);
 
     last_desired_seq_ = desired_seq_.load(std::memory_order_acquire);
 
@@ -248,17 +247,10 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
 
     if (seq != last_desired_seq_) {
       const auto* xdot_ptr = xdot_cmd_buffer_.readFromRT();
-      const auto* wrench_ptr = wrench_cmd_buffer_.readFromRT();
 
       if (xdot_ptr != nullptr) {
         for (int i = 0; i < cart_dims; ++i) {
           xdot_remote_(i) = (*xdot_ptr)[static_cast<size_t>(i)];
-        }
-      }
-
-      if (wrench_ptr != nullptr) {
-        for (int i = 0; i < cart_dims; ++i) {
-          wrench_remote_(i) = (*wrench_ptr)[static_cast<size_t>(i)];
         }
       }
 
@@ -296,6 +288,169 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
   }
 
   wrench_ext_ = wrenchFromTorque(jacobian, mass, tau_ext_);
+
+  // Predicted execution and blend-back use local Cartesian pose targets. Normal
+  // bilateral teleoperation continues through the TDPA path below.
+  bool use_pose_target = execution_running_.load(std::memory_order_acquire);
+
+  if (pending_blend_to_leader_.load(std::memory_order_acquire)) {
+    if (!blend_to_leader_enabled_) {
+      pending_blend_to_leader_.store(false, std::memory_order_release);
+      desired_position_ = current_position;
+      desired_orientation_ = current_orientation;
+      desired_rotation_ = current_orientation.toRotationMatrix();
+    } else {
+      const auto* goal = leader_pose_cache_.readFromRT();
+      if (goal) {
+        pending_blend_to_leader_.store(false, std::memory_order_release);
+        blend_pose_start_.px = current_position.x();
+        blend_pose_start_.py = current_position.y();
+        blend_pose_start_.pz = current_position.z();
+        desiredPoseFromQuaternion(current_orientation, &blend_pose_start_);
+        blend_pose_goal_ = *goal;
+
+        const Vector3d p0(blend_pose_start_.px, blend_pose_start_.py, blend_pose_start_.pz);
+        const Vector3d p1(blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
+        const double pos_dist = (p1 - p0).norm();
+        const Quaterniond q0 = quatFromDesiredPose(blend_pose_start_);
+        Quaterniond q1 = quatFromDesiredPose(blend_pose_goal_);
+        if (q0.dot(q1) < 0.0) {
+          q1.coeffs() *= -1.0;
+          desiredPoseFromQuaternion(q1, &blend_pose_goal_);
+        }
+        blend_duration_sec_ =
+            blend_seconds_per_meter_ * pos_dist +
+            blend_seconds_per_rad_ * q0.angularDistance(q1);
+        blend_duration_sec_ =
+            std::clamp(blend_duration_sec_, blend_duration_min_, blend_duration_max_);
+        blend_t0_ = this->get_node()->now();
+        blending_to_leader_.store(true, std::memory_order_release);
+        mode_.store(static_cast<uint8_t>(Mode::BLEND_TO_LEADER), std::memory_order_release);
+      }
+    }
+  }
+
+  if (blending_to_leader_.load(std::memory_order_acquire)) {
+    const double elapsed = (this->get_node()->now() - blend_t0_).seconds();
+    const double blend_s =
+        (blend_duration_sec_ > 1e-6)
+            ? std::min(1.0, elapsed / blend_duration_sec_)
+            : 1.0;
+    const Vector3d p0(blend_pose_start_.px, blend_pose_start_.py, blend_pose_start_.pz);
+    const Vector3d p1(blend_pose_goal_.px, blend_pose_goal_.py, blend_pose_goal_.pz);
+    const Vector3d p = (1.0 - blend_s) * p0 + blend_s * p1;
+    const Quaterniond q_interp = slerpShortestArc(
+        quatFromDesiredPose(blend_pose_start_),
+        quatFromDesiredPose(blend_pose_goal_), blend_s);
+
+    desired_pose_rt_.px = p.x();
+    desired_pose_rt_.py = p.y();
+    desired_pose_rt_.pz = p.z();
+    desiredPoseFromQuaternion(q_interp, &desired_pose_rt_);
+    use_pose_target = true;
+
+    if (blend_s >= 1.0 - 1e-6) {
+      desired_pose_rt_ = blend_pose_goal_;
+      desired_pose_buffer_.writeFromNonRT(blend_pose_goal_);
+      desired_pose_seq_.fetch_add(1, std::memory_order_release);
+      last_desired_pose_seq_ = desired_pose_seq_.load(std::memory_order_acquire);
+      blending_to_leader_.store(false, std::memory_order_release);
+      blend_running_hold_until_ =
+          this->get_node()->now() + rclcpp::Duration::from_seconds(blend_running_hold_sec_);
+      mode_.store(static_cast<uint8_t>(Mode::CARTESIAN), std::memory_order_release);
+
+      // Resume TDPA integration at the blend endpoint instead of jumping back
+      // to the pre-execution integrated target.
+      desired_position_ = p;
+      desired_orientation_ = q_interp;
+      desired_rotation_ = q_interp.toRotationMatrix();
+      x_remote_delta_intgl_.head<3>() = desired_position_ - position_start_;
+      x_remote_delta_intgl_.tail<3>() =
+          quatErrorToRotvec(orientation_start_, desired_orientation_);
+    }
+  } else if (use_pose_target) {
+    const uint64_t pose_seq = desired_pose_seq_.load(std::memory_order_acquire);
+    if (pose_seq != last_desired_pose_seq_) {
+      const auto* pose = desired_pose_buffer_.readFromRT();
+      if (pose) {
+        desired_pose_rt_ = *pose;
+      }
+      last_desired_pose_seq_ = pose_seq;
+    }
+  }
+
+  if (use_pose_target) {
+    const Vector3d pose_target(
+        desired_pose_rt_.px, desired_pose_rt_.py, desired_pose_rt_.pz);
+    const Quaterniond orientation_target = quatFromDesiredPose(desired_pose_rt_);
+    Vector6d pose_error = Vector6d::Zero();
+    pose_error.head<3>() = pose_target - current_position;
+    pose_error.tail<3>() = quatErrorToRotvec(current_orientation, orientation_target);
+
+    const Vector6d execution_wrench = stiffness_ * pose_error - damping_ * xdot_local_;
+    const Vector7d tau_task_execution = jacobian.transpose() * execution_wrench;
+    Eigen::MatrixXd jacobian_transpose_pinv;
+    pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
+    const Vector7d tau_nullspace_execution =
+        (Matrix7d::Identity() - jacobian.transpose() * jacobian_transpose_pinv) *
+        (n_stiffness_ * (desired_qn_ - q_) -
+         (2.0 * std::sqrt(n_stiffness_)) * dq_);
+    const auto coriolis_array = franka_robot_model_->getCoriolisForceVector();
+    const Vector7d coriolis = Eigen::Map<const Vector7d>(coriolis_array.data());
+    const Vector7d tau_d_execution =
+        tau_task_execution + coriolis + tau_nullspace_execution;
+
+    std::array<double, 7> tau_des{};
+    std::array<double, 7> tau_prev{};
+    for (int i = 0; i < num_joints; ++i) {
+      tau_des[static_cast<size_t>(i)] = tau_d_execution(i);
+      tau_prev[static_cast<size_t>(i)] =
+          last_tau_cmd_initialized_ ? last_tau_cmd_(i) : tau_d_execution(i);
+    }
+    const auto tau_limited = franka::limitRate(franka::kMaxTorqueRate, tau_des, tau_prev);
+    Vector7d tau_applied = Vector7d::Zero();
+    for (int i = 0; i < num_joints; ++i) {
+      tau_applied(i) = tau_limited[static_cast<size_t>(i)];
+      command_interfaces_[i].set_value(tau_applied(i));
+      last_tau_cmd_(i) = tau_applied(i);
+    }
+    last_tau_cmd_initialized_ = true;
+    wrench_applied_ = wrenchFromTorque(
+        jacobian, mass, tau_applied - tau_nullspace_execution - coriolis);
+    wrench_applied_initialized_ = true;
+
+    if (local_state_pub_ && local_state_pub_->trylock()) {
+      auto& msg = local_state_pub_->msg_;
+      const rclcpp::Time now = get_node()->now();
+      msg.header.stamp = now;
+      msg.seq = local_seq_++;
+      msg.tx_time_ns = now.nanoseconds();
+      msg.echo_seq = last_received_remote_seq_;
+      msg.echo_tx_time_ns = last_received_remote_tx_time_ns_;
+      msg.pandatime = pandatime_;
+      for (int i = 0; i < cart_dims; ++i) {
+        msg.x_local_delta[static_cast<size_t>(i)] = x_local_delta_(i);
+        msg.xdot_local[static_cast<size_t>(i)] = xdot_local_(i);
+        msg.wrench_local[static_cast<size_t>(i)] =
+            tau_ext_feedback_ ? wrench_ext_(i) : wrench_applied_(i);
+      }
+      msg.energy = E_F_in_;
+      msg.energy_linear = E_F_in_linear_;
+      msg.energy_rotational = E_F_in_rotational_;
+      local_state_pub_->unlockAndPublish();
+    }
+
+    const bool blend_now =
+        blending_to_leader_.load(std::memory_order_relaxed) ||
+        (this->get_node()->now() < blend_running_hold_until_);
+    if (pub_blend_running_ && blend_now != last_blend_running_published_) {
+      std_msgs::msg::Bool msg;
+      msg.data = blend_now;
+      pub_blend_running_->publish(msg);
+      last_blend_running_published_ = blend_now;
+    }
+    return controller_interface::return_type::OK;
+  }
 
   const double gain_tau_f = tau_ext_feedback_ ? 1.0 : -1.0;
 
@@ -339,8 +494,6 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
 
   shortage_linear_ += dt * eta_ * dissipation_linear;
   shortage_rotational_ += dt * eta_ * dissipation_rotational;
-  shortage_ = shortage_linear_ + shortage_rotational_;
-
   followerPC_linear_.energyController(
       v_des_linear,
       f_old_linear,
@@ -372,8 +525,6 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
   x_remote_delta_intgl_.tail<3>() =
       quatErrorToRotvec(orientation_start_, desired_orientation_);
 
-  x_des_ = x_remote_delta_intgl_;
-
   position_error_.setZero();
   position_error_.head<3>() =
       x_remote_delta_intgl_.head<3>() - x_remote_delta_.head<3>();
@@ -384,27 +535,12 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
       quatErrorToRotvec(current_orientation, desired_orientation_);
 
   const Vector6d vel_error_tdpa = xdot_des - xdot_local_;
-  const Vector6d vel_error_nom = xdot_remote_mod - xdot_local_;
 
   wrench_c_ = stiffness_ * error + damping_ * vel_error_tdpa;
-  wrench_c_no_mod_dq_ = stiffness_ * error + damping_ * vel_error_nom;
-  wrench_diff_ = wrench_c_no_mod_dq_ - wrench_c_;
-
-  beta_linear_ = followerPC_linear_.getBeta();
-  beta_rotational_ = followerPC_rotational_.getBeta();
-  beta_ = std::max(std::abs(beta_linear_), std::abs(beta_rotational_));
 
   E_F_in_linear_ = followerPC_linear_.getInputEnergyFlow();
   E_F_in_rotational_ = followerPC_rotational_.getInputEnergyFlow();
   E_F_in_ = E_F_in_linear_ + E_F_in_rotational_;
-
-  E_F_out_linear_ = followerPC_linear_.getOutputEnergyFlow();
-  E_F_out_rotational_ = followerPC_rotational_.getOutputEnergyFlow();
-  E_F_out_ = E_F_out_linear_ + E_F_out_rotational_;
-
-  E_F_diss_linear_ = followerPC_linear_.getDissipatedEnergyFlow();
-  E_F_diss_rotational_ = followerPC_rotational_.getDissipatedEnergyFlow();
-  E_F_diss_ = E_F_diss_linear_ + E_F_diss_rotational_;
 
   Eigen::MatrixXd jacobian_transpose_pinv;
   pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
@@ -469,6 +605,16 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
     msg.energy_rotational = E_F_in_rotational_;
 
     local_state_pub_->unlockAndPublish();
+  }
+
+  const bool blend_now =
+      blending_to_leader_.load(std::memory_order_relaxed) ||
+      (this->get_node()->now() < blend_running_hold_until_);
+  if (pub_blend_running_ && blend_now != last_blend_running_published_) {
+    std_msgs::msg::Bool msg;
+    msg.data = blend_now;
+    pub_blend_running_->publish(msg);
+    last_blend_running_published_ = blend_now;
   }
 
   return controller_interface::return_type::OK;
@@ -815,7 +961,6 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
     CartesianArray init{};
     init.fill(0.0);
     xdot_cmd_buffer_.writeFromNonRT(init);
-    wrench_cmd_buffer_.writeFromNonRT(init);
 
     auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
 
@@ -835,28 +980,28 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
             local_state_pub_raw_);
 
     tdpaReset_();
-  } else {
-    sub_leader_robot_state_ =
-        get_node()->create_subscription<franka_msgs::msg::FrankaState>(
-            leader_robot_state_topic_, rclcpp::QoS(1),
-            std::bind(&CartesianImpedanceController::leaderRobotStateCallback, this,
-                      std::placeholders::_1));
-
-    sub_execution_pose_ =
-        get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
-            execution_pose_topic_, rclcpp::QoS(10),
-            std::bind(&CartesianImpedanceController::executionDesiredPoseCallback, this,
-                      std::placeholders::_1));
-
-    sub_execution_running_ =
-        get_node()->create_subscription<std_msgs::msg::Bool>(
-            execution_running_topic_, rclcpp::QoS(1).transient_local(),
-            std::bind(&CartesianImpedanceController::executionRunningCallback, this,
-                      std::placeholders::_1));
-
-    pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
-        blend_running_topic_, rclcpp::QoS(1).transient_local());
   }
+
+  sub_leader_robot_state_ =
+      get_node()->create_subscription<franka_msgs::msg::FrankaState>(
+          leader_robot_state_topic_, rclcpp::QoS(1),
+          std::bind(&CartesianImpedanceController::leaderRobotStateCallback, this,
+                    std::placeholders::_1));
+
+  sub_execution_pose_ =
+      get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+          execution_pose_topic_, rclcpp::QoS(10),
+          std::bind(&CartesianImpedanceController::executionDesiredPoseCallback, this,
+                    std::placeholders::_1));
+
+  sub_execution_running_ =
+      get_node()->create_subscription<std_msgs::msg::Bool>(
+          execution_running_topic_, rclcpp::QoS(1).transient_local(),
+          std::bind(&CartesianImpedanceController::executionRunningCallback, this,
+                    std::placeholders::_1));
+
+  pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
+      blend_running_topic_, rclcpp::QoS(1).transient_local());
 
   return CallbackReturn::SUCCESS;
 }
@@ -899,6 +1044,18 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
 
   desired_qn_ = Vector7d(franka_robot_model_->getRobotState()->q.data());
 
+  prev_execution_running_ = false;
+  execution_running_.store(false, std::memory_order_release);
+  pending_blend_to_leader_.store(false, std::memory_order_release);
+  blending_to_leader_.store(false, std::memory_order_release);
+  blend_running_hold_until_ = this->get_node()->now();
+  last_blend_running_published_ = false;
+  if (pub_blend_running_) {
+    std_msgs::msg::Bool msg;
+    msg.data = false;
+    pub_blend_running_->publish(msg);
+  }
+
   if (TDPA_active_) {
     position_start_ = init_pos;
     orientation_start_ = init_ori;
@@ -909,7 +1066,6 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
     CartesianArray init_arr{};
     init_arr.fill(0.0);
     xdot_cmd_buffer_.writeFromNonRT(init_arr);
-    wrench_cmd_buffer_.writeFromNonRT(init_arr);
 
     last_desired_seq_ = desired_seq_.load(std::memory_order_acquire);
 
@@ -926,18 +1082,6 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
     wrench_applied_.setZero();
     wrench_applied_initialized_ = false;
   } else {
-    prev_execution_running_ = false;
-    execution_running_.store(false, std::memory_order_release);
-    pending_blend_to_leader_.store(false, std::memory_order_release);
-    blending_to_leader_.store(false, std::memory_order_release);
-    blend_running_hold_until_ = this->get_node()->now();
-    last_blend_running_published_ = false;
-    if (pub_blend_running_) {
-      std_msgs::msg::Bool m;
-      m.data = false;
-      pub_blend_running_->publish(m);
-    }
-
     stiffness_.setIdentity();
     stiffness_.topLeftCorner(3, 3) = pos_stiff_ * Matrix3d::Identity();
     stiffness_.bottomRightCorner(3, 3) = rot_stiff_ * Matrix3d::Identity();
@@ -992,19 +1136,14 @@ void CartesianImpedanceController::remoteStateCallback(
   last_received_remote_tx_time_ns_ = msg.tx_time_ns;
 
   CartesianArray xdot_remote_arr{};
-  CartesianArray wrench_remote_arr{};
-
   xdot_remote_arr.fill(0.0);
-  wrench_remote_arr.fill(0.0);
 
   for (int i = 0; i < cart_dims; ++i) {
     x_remote_delta_(i) = msg.x_local_delta[static_cast<size_t>(i)];
     xdot_remote_arr[static_cast<size_t>(i)] = msg.xdot_local[static_cast<size_t>(i)];
-    wrench_remote_arr[static_cast<size_t>(i)] = msg.wrench_local[static_cast<size_t>(i)];
   }
 
   xdot_cmd_buffer_.writeFromNonRT(xdot_remote_arr);
-  wrench_cmd_buffer_.writeFromNonRT(wrench_remote_arr);
 
   desired_seq_.fetch_add(1, std::memory_order_release);
 
