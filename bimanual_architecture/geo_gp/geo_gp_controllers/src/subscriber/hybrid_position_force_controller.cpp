@@ -481,6 +481,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
 
   bool skip_pose_read_this_cycle = false;
   bool skip_tdpa_cmd_read_this_cycle = false;
+  bool blend_pose_target_this_cycle = false;
 
   const auto mode_now = static_cast<Mode>(mode_.load(std::memory_order_relaxed));
   if (mode_now == Mode::MOVE_TO_START) {
@@ -525,7 +526,6 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
     last_tdpa_cmd_seq_ = tdpa_cmd_seq_.load(std::memory_order_acquire);
 
     pandatime_ = 0.0;
-    remote_pandatime_ = 0.0;
     tdpaReset_();
 
     accept_desired_.store(true, std::memory_order_release);
@@ -586,6 +586,7 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
 
   if (static_cast<Mode>(mode_.load(std::memory_order_relaxed)) ==
       Mode::BLEND_TO_LEADER) {
+    blend_pose_target_this_cycle = true;
     const double elapsed = (this->get_node()->now() - blend_t0_).seconds();
     const double s =
         (blend_duration_sec_ > 1e-6) ? std::min(1.0, elapsed / blend_duration_sec_) : 1.0;
@@ -688,6 +689,133 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
   }
   wrench_ext_ = wrenchFromTorque(jacobian_mat, mass, tau_ext);
 
+  const bool force_control_on_hybrid_axis =
+      execution_running_.load(std::memory_order_relaxed);
+  if (force_control_on_hybrid_axis != last_execution_running_for_z_axis_) {
+    force_error_integral_ = 0.0;
+    last_execution_running_for_z_axis_ = force_control_on_hybrid_axis;
+  }
+
+  const bool use_pose_target =
+      force_control_on_hybrid_axis || blend_pose_target_this_cycle;
+
+  if (use_pose_target) {
+    Vector3d desired_position;
+    desired_position << desired_pose_rt_.px, desired_pose_rt_.py, desired_pose_rt_.pz;
+    Quaterniond desired_orientation = quatFromDesiredPose(desired_pose_rt_);
+
+    Vector3d position_error = current_position - desired_position;
+    Vector3d linear_velocity = xdot_local_.head<3>();
+    Vector3d angular_velocity = xdot_local_.tail<3>();
+
+    if (desired_orientation.coeffs().dot(current_orientation.coeffs()) < 0.0) {
+      current_orientation.coeffs() = -current_orientation.coeffs();
+    }
+
+    Quaterniond rot_error(current_orientation * desired_orientation.inverse());
+    Eigen::AngleAxisd rot_error_aa(rot_error);
+    Vector3d orientation_error = rot_error_aa.axis() * rot_error_aa.angle();
+
+    Vector6d wrench_command = Vector6d::Zero();
+    for (int axis = 0; axis < 3; ++axis) {
+      if (force_control_on_hybrid_axis && axis == force_axis_) {
+        continue;
+      }
+      wrench_command(axis) =
+          -pos_stiff_ * position_error(axis) - translational_damping_ * linear_velocity(axis);
+    }
+
+    if (force_control_on_hybrid_axis) {
+      double raw_force_measurement = robot_state->O_F_ext_hat_K[force_axis_];
+      if (!std::isfinite(raw_force_measurement)) {
+        raw_force_measurement =
+            force_filter_initialized_ ? filtered_force_measurement_ : 0.0;
+      }
+
+      if (!force_filter_initialized_) {
+        filtered_force_measurement_ = raw_force_measurement;
+        force_filter_initialized_ = true;
+      } else {
+        filtered_force_measurement_ =
+            measured_force_filter_alpha_ * filtered_force_measurement_ +
+            (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
+      }
+
+      const double force_error = desired_force_rt_.value - filtered_force_measurement_;
+      force_error_integral_ =
+          clampRange(force_error_integral_ + dt * force_error,
+                     -force_integral_limit_, force_integral_limit_);
+
+      double hybrid_axis_wrench =
+          force_feedforward_scale_ * desired_force_rt_.value +
+          force_kp_ * force_error +
+          force_ki_ * force_error_integral_ -
+          force_damping_ * linear_velocity(force_axis_);
+      hybrid_axis_wrench = clampAbs(hybrid_axis_wrench, force_command_max_abs_);
+      wrench_command(force_axis_) = hybrid_axis_wrench;
+    }
+
+    wrench_command.tail<3>() =
+        -rot_stiff_ * orientation_error - rotational_damping_ * angular_velocity;
+
+    Vector7d tau_task = jacobian_mat.transpose() * wrench_command;
+
+    Eigen::MatrixXd jacobian_transpose_pinv;
+    pseudoInverse(jacobian_mat.transpose(), jacobian_transpose_pinv);
+
+    Vector7d tau_nullspace =
+        (Eigen::MatrixXd::Identity(kNumJoints, kNumJoints) -
+         jacobian_mat.transpose() * jacobian_transpose_pinv) *
+        (n_stiffness_ * (desired_qn_ - q) - (2.0 * std::sqrt(n_stiffness_)) * qD);
+
+    Vector7d tau_d = tau_task + coriolis + tau_nullspace;
+
+    for (int i = 0; i < kNumJoints; ++i) {
+      command_interfaces_[i].set_value(tau_d(i));
+    }
+
+    wrench_applied_ = wrench_command;
+    wrench_applied_initialized_ = true;
+
+    if (local_state_pub_ && local_state_pub_->trylock()) {
+      auto& msg = local_state_pub_->msg_;
+      const rclcpp::Time now = get_node()->now();
+      const int64_t now_ns = now.nanoseconds();
+
+      msg.header.stamp = now;
+      msg.seq = local_seq_++;
+      msg.tx_time_ns = now_ns;
+      msg.echo_seq = last_received_remote_seq_;
+      msg.echo_tx_time_ns = last_received_remote_tx_time_ns_;
+      msg.pandatime = pandatime_;
+
+      for (int i = 0; i < kCartDims; ++i) {
+        msg.x_local_delta[static_cast<size_t>(i)] = x_local_delta_(i);
+        msg.xdot_local[static_cast<size_t>(i)] = xdot_local_(i);
+        msg.wrench_local[static_cast<size_t>(i)] =
+            tau_ext_feedback_ ? wrench_ext_(i) : wrench_applied_(i);
+      }
+
+      msg.energy = E_F_in_;
+      msg.energy_linear = E_F_in_linear_;
+      msg.energy_rotational = E_F_in_rotational_;
+
+      local_state_pub_->unlockAndPublish();
+    }
+
+    const bool blend_now =
+        blending_to_leader_.load(std::memory_order_relaxed) ||
+        (this->get_node()->now() < blend_running_hold_until_);
+    if (pub_blend_running_ && blend_now != last_blend_running_published_) {
+      std_msgs::msg::Bool msg;
+      msg.data = blend_now;
+      pub_blend_running_->publish(msg);
+      last_blend_running_published_ = blend_now;
+    }
+
+    return controller_interface::return_type::OK;
+  }
+
   const double gain_tau_f = tau_ext_feedback_ ? 1.0 : -1.0;
 
   double v_remote_linear[6]{};
@@ -740,40 +868,21 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
     xdot_des(i + 3) = v_des_rotational[i + 3];
   }
 
-  const bool force_control_on_hybrid_axis =
-      execution_running_.load(std::memory_order_relaxed);
-  if (force_control_on_hybrid_axis != last_execution_running_for_z_axis_) {
-    force_error_integral_ = 0.0;
-    last_execution_running_for_z_axis_ = force_control_on_hybrid_axis;
-  }
+  desired_position_tdpa_ += dt * xdot_des.head<3>();
+  desired_rotation_tdpa_ =
+      integrateRotationWorld(desired_rotation_tdpa_, xdot_des.tail<3>(), dt);
+  desired_orientation_tdpa_ = Quaterniond(desired_rotation_tdpa_);
+  desired_orientation_tdpa_.normalize();
 
-  const bool use_tdpa_integrated_pose =
-      !force_control_on_hybrid_axis &&
-      static_cast<Mode>(mode_.load(std::memory_order_relaxed)) == Mode::HYBRID;
+  Vector3d desired_position = desired_position_tdpa_;
+  Quaterniond desired_orientation = desired_orientation_tdpa_;
 
-  Vector3d desired_position;
-  Quaterniond desired_orientation;
+  x_remote_delta_intgl_.head<3>() = desired_position - position_start_;
+  x_remote_delta_intgl_.tail<3>() =
+      quatErrorToRotvec(orientation_start_, desired_orientation);
 
-  if (use_tdpa_integrated_pose) {
-    desired_position_tdpa_ += dt * xdot_des.head<3>();
-    desired_rotation_tdpa_ =
-        integrateRotationWorld(desired_rotation_tdpa_, xdot_des.tail<3>(), dt);
-    desired_orientation_tdpa_ = Quaterniond(desired_rotation_tdpa_);
-    desired_orientation_tdpa_.normalize();
-
-    desired_position = desired_position_tdpa_;
-    desired_orientation = desired_orientation_tdpa_;
-
-    x_remote_delta_intgl_.head<3>() = desired_position - position_start_;
-    x_remote_delta_intgl_.tail<3>() =
-        quatErrorToRotvec(orientation_start_, desired_orientation);
-
-    for (int i = 0; i < kCartDims; ++i) {
-      position_error_tdpa_(i) = x_remote_delta_intgl_(i) - x_remote_delta_(i);
-    }
-  } else {
-    desired_position << desired_pose_rt_.px, desired_pose_rt_.py, desired_pose_rt_.pz;
-    desired_orientation = quatFromDesiredPose(desired_pose_rt_);
+  for (int i = 0; i < kCartDims; ++i) {
+    position_error_tdpa_(i) = x_remote_delta_intgl_(i) - x_remote_delta_(i);
   }
 
   Vector3d position_error = current_position - desired_position;
@@ -790,42 +899,9 @@ controller_interface::return_type HybridPositionForceController::updateWithTdpa_
 
   Vector6d wrench_command = Vector6d::Zero();
   for (int axis = 0; axis < 3; ++axis) {
-    if (force_control_on_hybrid_axis && axis == force_axis_) {
-      continue;
-    }
     const double vel_error = linear_velocity(axis) - xdot_des(axis);
     wrench_command(axis) =
         -pos_stiff_ * position_error(axis) - translational_damping_ * vel_error;
-  }
-
-  if (force_control_on_hybrid_axis) {
-    double raw_force_measurement = robot_state->O_F_ext_hat_K[force_axis_];
-    if (!std::isfinite(raw_force_measurement)) {
-      raw_force_measurement =
-          force_filter_initialized_ ? filtered_force_measurement_ : 0.0;
-    }
-
-    if (!force_filter_initialized_) {
-      filtered_force_measurement_ = raw_force_measurement;
-      force_filter_initialized_ = true;
-    } else {
-      filtered_force_measurement_ =
-          measured_force_filter_alpha_ * filtered_force_measurement_ +
-          (1.0 - measured_force_filter_alpha_) * raw_force_measurement;
-    }
-
-    const double force_error = desired_force_rt_.value - filtered_force_measurement_;
-    force_error_integral_ =
-        clampRange(force_error_integral_ + dt * force_error,
-                   -force_integral_limit_, force_integral_limit_);
-
-    double hybrid_axis_wrench =
-        force_feedforward_scale_ * desired_force_rt_.value +
-        force_kp_ * force_error +
-        force_ki_ * force_error_integral_ -
-        force_damping_ * linear_velocity(force_axis_);
-    hybrid_axis_wrench = clampAbs(hybrid_axis_wrench, force_command_max_abs_);
-    wrench_command(force_axis_) = hybrid_axis_wrench;
   }
 
   for (int i = 0; i < 3; ++i) {
@@ -1192,7 +1268,6 @@ CallbackReturn HybridPositionForceController::on_activate(
     xdot_cmd_buffer_.writeFromNonRT(zero_cmd);
 
     pandatime_ = 0.0;
-    remote_pandatime_ = 0.0;
     local_seq_ = 0;
     last_received_remote_seq_ = 0;
     last_received_remote_tx_time_ns_ = 0;
@@ -1242,7 +1317,6 @@ void HybridPositionForceController::remoteStateCallback(
     return;
   }
 
-  remote_pandatime_ = msg.pandatime;
   last_received_remote_seq_ = msg.seq;
   last_received_remote_tx_time_ns_ = msg.tx_time_ns;
 
@@ -1263,7 +1337,6 @@ void HybridPositionForceController::remoteStateCallback(
   if (std::isfinite(msg.energy_rotational)) {
     E_L_in_delayed_rotational_ = msg.energy_rotational;
   }
-  E_L_in_delayed_ = E_L_in_delayed_linear_ + E_L_in_delayed_rotational_;
 }
 
 void HybridPositionForceController::leaderRobotStateCallback(

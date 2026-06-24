@@ -138,7 +138,6 @@ private:
   std::string local_state_topic_{"follower/tdpa_cartesian_state"};
 
   double pandatime_{0.0};
-  double remote_pandatime_{0.0};
 
   Vector6d x_local_delta_{Vector6d::Zero()};
   Vector6d x_remote_delta_{Vector6d::Zero()};
@@ -156,7 +155,6 @@ private:
   Quaterniond desired_orientation_tdpa_{Quaterniond::Identity()};
   Matrix3d desired_rotation_tdpa_{Matrix3d::Identity()};
 
-  double E_L_in_delayed_{0.0};
   double E_L_in_delayed_linear_{0.0};
   double E_L_in_delayed_rotational_{0.0};
   double E_F_in_{0.0};
@@ -232,7 +230,6 @@ private:
   CartesianTDPAFollower followerPC_rotational_;
 
   inline void tdpaReset_() {
-    E_L_in_delayed_ = 0.0;
     E_L_in_delayed_linear_ = 0.0;
     E_L_in_delayed_rotational_ = 0.0;
     E_F_in_ = 0.0;
