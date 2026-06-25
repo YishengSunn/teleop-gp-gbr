@@ -379,6 +379,110 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
     }
   }
 
+  const double gain_tau_f = tau_ext_feedback_ ? 1.0 : -1.0;
+
+  double v_remote_linear[6]{};
+  double v_remote_rotational[6]{};
+  double f_old_linear[6]{};
+  double f_old_rotational[6]{};
+  double v_des_linear[6]{};
+  double v_des_rotational[6]{};
+
+  for (int i = 0; i < 3; ++i) {
+    const double old_linear =
+        tau_ext_feedback_ ? wrench_ext_(i)
+                          : (wrench_applied_initialized_ ? wrench_applied_(i) : 0.0);
+
+    const double old_rotational =
+        tau_ext_feedback_ ? wrench_ext_(i + 3)
+                          : (wrench_applied_initialized_ ? wrench_applied_(i + 3) : 0.0);
+
+    v_remote_linear[i] = xdot_remote_mod(i);
+    v_remote_rotational[i + 3] = xdot_remote_mod(i + 3);
+
+    f_old_linear[i] = gain_tau_f * old_linear;
+    f_old_rotational[i + 3] = gain_tau_f * old_rotational;
+
+    v_des_linear[i] = v_remote_linear[i];
+    v_des_rotational[i + 3] = v_remote_rotational[i + 3];
+  }
+
+  followerPC_linear_.energyObserver(v_remote_linear, f_old_linear, dt);
+  followerPC_rotational_.energyObserver(v_remote_rotational, f_old_rotational, dt);
+
+  const Matrix3d damping_linear = damping_.topLeftCorner<3, 3>();
+  const Matrix3d damping_rotational = damping_.bottomRightCorner<3, 3>();
+
+  const double dissipation_linear =
+      xdot_local_.head<3>().dot(damping_linear * xdot_local_.head<3>());
+
+  const double dissipation_rotational =
+      xdot_local_.tail<3>().dot(damping_rotational * xdot_local_.tail<3>());
+
+  shortage_linear_ += dt * eta_ * dissipation_linear;
+  shortage_rotational_ += dt * eta_ * dissipation_rotational;
+  followerPC_linear_.energyController(
+      v_des_linear,
+      f_old_linear,
+      E_L_in_delayed_linear_ + shortage_linear_,
+      dt);
+
+  followerPC_rotational_.energyController(
+      v_des_rotational,
+      f_old_rotational,
+      E_L_in_delayed_rotational_ + shortage_rotational_,
+      dt);
+
+  Vector6d xdot_des = Vector6d::Zero();
+
+  for (int i = 0; i < 3; ++i) {
+    xdot_des(i) = v_des_linear[i];
+    xdot_des(i + 3) = v_des_rotational[i + 3];
+  }
+
+  desired_position_ += dt * xdot_des.head<3>();
+
+  desired_rotation_ =
+      integrateRotationWorld(desired_rotation_, xdot_des.tail<3>(), dt);
+
+  desired_orientation_ = Quaterniond(desired_rotation_);
+  desired_orientation_.normalize();
+
+  if (tdpa_integrated_pose_pub_ && tdpa_integrated_pose_pub_->trylock()) {
+    auto& msg = tdpa_integrated_pose_pub_->msg_;
+    msg.header.stamp = get_node()->now();
+    msg.header.frame_id = arm_id_ + "_base";
+    msg.pose.position.x = desired_position_.x();
+    msg.pose.position.y = desired_position_.y();
+    msg.pose.position.z = desired_position_.z();
+    msg.pose.orientation.x = desired_orientation_.x();
+    msg.pose.orientation.y = desired_orientation_.y();
+    msg.pose.orientation.z = desired_orientation_.z();
+    msg.pose.orientation.w = desired_orientation_.w();
+    tdpa_integrated_pose_pub_->unlockAndPublish();
+  }
+
+  x_remote_delta_intgl_.head<3>() = desired_position_ - position_start_;
+  x_remote_delta_intgl_.tail<3>() =
+      quatErrorToRotvec(orientation_start_, desired_orientation_);
+
+  position_error_.setZero();
+  position_error_.head<3>() =
+      x_remote_delta_intgl_.head<3>() - x_remote_delta_.head<3>();
+
+  Vector6d error = Vector6d::Zero();
+  error.head<3>() = desired_position_ - current_position;
+  error.tail<3>() =
+      quatErrorToRotvec(current_orientation, desired_orientation_);
+
+  const Vector6d vel_error_tdpa = xdot_des - xdot_local_;
+
+  wrench_c_ = stiffness_ * error + damping_ * vel_error_tdpa;
+
+  E_F_in_linear_ = followerPC_linear_.getInputEnergyFlow();
+  E_F_in_rotational_ = followerPC_rotational_.getInputEnergyFlow();
+  E_F_in_ = E_F_in_linear_ + E_F_in_rotational_;
+
   if (use_pose_target) {
     const Vector3d pose_target(
         desired_pose_rt_.px, desired_pose_rt_.py, desired_pose_rt_.pz);
@@ -451,96 +555,6 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
     }
     return controller_interface::return_type::OK;
   }
-
-  const double gain_tau_f = tau_ext_feedback_ ? 1.0 : -1.0;
-
-  double v_remote_linear[6]{};
-  double v_remote_rotational[6]{};
-  double f_old_linear[6]{};
-  double f_old_rotational[6]{};
-  double v_des_linear[6]{};
-  double v_des_rotational[6]{};
-
-  for (int i = 0; i < 3; ++i) {
-    const double old_linear =
-        tau_ext_feedback_ ? wrench_ext_(i)
-                          : (wrench_applied_initialized_ ? wrench_applied_(i) : 0.0);
-
-    const double old_rotational =
-        tau_ext_feedback_ ? wrench_ext_(i + 3)
-                          : (wrench_applied_initialized_ ? wrench_applied_(i + 3) : 0.0);
-
-    v_remote_linear[i] = xdot_remote_mod(i);
-    v_remote_rotational[i + 3] = xdot_remote_mod(i + 3);
-
-    f_old_linear[i] = gain_tau_f * old_linear;
-    f_old_rotational[i + 3] = gain_tau_f * old_rotational;
-
-    v_des_linear[i] = v_remote_linear[i];
-    v_des_rotational[i + 3] = v_remote_rotational[i + 3];
-  }
-
-  followerPC_linear_.energyObserver(v_remote_linear, f_old_linear, dt);
-  followerPC_rotational_.energyObserver(v_remote_rotational, f_old_rotational, dt);
-
-  const Matrix3d damping_linear = damping_.topLeftCorner<3, 3>();
-  const Matrix3d damping_rotational = damping_.bottomRightCorner<3, 3>();
-
-  const double dissipation_linear =
-      xdot_local_.head<3>().dot(damping_linear * xdot_local_.head<3>());
-
-  const double dissipation_rotational =
-      xdot_local_.tail<3>().dot(damping_rotational * xdot_local_.tail<3>());
-
-  shortage_linear_ += dt * eta_ * dissipation_linear;
-  shortage_rotational_ += dt * eta_ * dissipation_rotational;
-  followerPC_linear_.energyController(
-      v_des_linear,
-      f_old_linear,
-      E_L_in_delayed_linear_ + shortage_linear_,
-      dt);
-
-  followerPC_rotational_.energyController(
-      v_des_rotational,
-      f_old_rotational,
-      E_L_in_delayed_rotational_ + shortage_rotational_,
-      dt);
-
-  Vector6d xdot_des = Vector6d::Zero();
-
-  for (int i = 0; i < 3; ++i) {
-    xdot_des(i) = v_des_linear[i];
-    xdot_des(i + 3) = v_des_rotational[i + 3];
-  }
-
-  desired_position_ += dt * xdot_des.head<3>();
-
-  desired_rotation_ =
-      integrateRotationWorld(desired_rotation_, xdot_des.tail<3>(), dt);
-
-  desired_orientation_ = Quaterniond(desired_rotation_);
-  desired_orientation_.normalize();
-
-  x_remote_delta_intgl_.head<3>() = desired_position_ - position_start_;
-  x_remote_delta_intgl_.tail<3>() =
-      quatErrorToRotvec(orientation_start_, desired_orientation_);
-
-  position_error_.setZero();
-  position_error_.head<3>() =
-      x_remote_delta_intgl_.head<3>() - x_remote_delta_.head<3>();
-
-  Vector6d error = Vector6d::Zero();
-  error.head<3>() = desired_position_ - current_position;
-  error.tail<3>() =
-      quatErrorToRotvec(current_orientation, desired_orientation_);
-
-  const Vector6d vel_error_tdpa = xdot_des - xdot_local_;
-
-  wrench_c_ = stiffness_ * error + damping_ * vel_error_tdpa;
-
-  E_F_in_linear_ = followerPC_linear_.getInputEnergyFlow();
-  E_F_in_rotational_ = followerPC_rotational_.getInputEnergyFlow();
-  E_F_in_ = E_F_in_linear_ + E_F_in_rotational_;
 
   Eigen::MatrixXd jacobian_transpose_pinv;
   pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
@@ -873,6 +887,7 @@ CartesianImpedanceController::on_init() {
     auto_declare<double>("eta_passivity_shortage", 0.0);
     auto_declare<std::string>("remote_state_topic", "leader/tdpa_cartesian_state");
     auto_declare<std::string>("local_state_topic", "follower/tdpa_cartesian_state");
+    auto_declare<std::string>("tdpa_integrated_pose_topic", "/tdpa/integrated_desired_pose");
 
   }
 
@@ -913,6 +928,8 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
   eta_ = get_node()->get_parameter("eta_passivity_shortage").as_double();
   remote_state_topic_ = get_node()->get_parameter("remote_state_topic").as_string();
   local_state_topic_ = get_node()->get_parameter("local_state_topic").as_string();
+  tdpa_integrated_pose_topic_ =
+      get_node()->get_parameter("tdpa_integrated_pose_topic").as_string();
 
   move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
   const auto start_q = get_node()->get_parameter("start_joint_configuration").as_double_array();
@@ -978,6 +995,14 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
         std::make_unique<
             realtime_tools::RealtimePublisher<geo_gp_interfaces::msg::TDPACartesianState>>(
             local_state_pub_raw_);
+
+    tdpa_integrated_pose_pub_raw_ =
+        get_node()->create_publisher<geometry_msgs::msg::PoseStamped>(
+            tdpa_integrated_pose_topic_, qos);
+    tdpa_integrated_pose_pub_ =
+        std::make_unique<
+            realtime_tools::RealtimePublisher<geometry_msgs::msg::PoseStamped>>(
+            tdpa_integrated_pose_pub_raw_);
 
     tdpaReset_();
   }

@@ -121,6 +121,7 @@ private:
   std::string blend_running_topic_{"/execution/blend_to_leader_running"};
   std::string remote_state_topic_{"leader/tdpa_cartesian_state"};
   std::string local_state_topic_{"follower/tdpa_cartesian_state"};
+  std::string tdpa_integrated_pose_topic_{"/tdpa/integrated_desired_pose"};
   bool blend_to_leader_enabled_{true};
   double blend_seconds_per_meter_{2.0};
   double blend_seconds_per_rad_{1.2};
@@ -208,6 +209,10 @@ private:
   std::unique_ptr<
       realtime_tools::RealtimePublisher<geo_gp_interfaces::msg::TDPACartesianState>>
       local_state_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr
+      tdpa_integrated_pose_pub_raw_;
+  std::unique_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::PoseStamped>>
+      tdpa_integrated_pose_pub_;
 
   // Move-to-start runtime
   std::unique_ptr<MotionGenerator> motion_generator_;
