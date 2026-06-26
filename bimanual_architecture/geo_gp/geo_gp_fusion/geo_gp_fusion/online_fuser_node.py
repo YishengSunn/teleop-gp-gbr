@@ -38,6 +38,9 @@ class OnlineFuserNode(Node):
         self.declare_parameter('confidence_gain', 1.0)
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
+        self.declare_parameter('progressive_update_enabled', True)
+        self.declare_parameter('progressive_match_pos_eps', 1e-3)
+        self.declare_parameter('progressive_match_time_eps', 1e-3)
 
         self.prediction_topic = self.get_parameter('prediction_topic').value
         self.tdpa_pose_topic = self.get_parameter('tdpa_pose_topic').value
@@ -48,6 +51,15 @@ class OnlineFuserNode(Node):
         self.confidence_gain = float(self.get_parameter('confidence_gain').value)
         self.min_prediction_weight = float(self.get_parameter('min_prediction_weight').value)
         self.max_prediction_weight = float(self.get_parameter('max_prediction_weight').value)
+        self.progressive_update_enabled = bool(
+            self.get_parameter('progressive_update_enabled').value
+        )
+        self.progressive_match_pos_eps = float(
+            self.get_parameter('progressive_match_pos_eps').value
+        )
+        self.progressive_match_time_eps = float(
+            self.get_parameter('progressive_match_time_eps').value
+        )
 
         self._lock = threading.Lock()
         self._latest_leader_pose = None
@@ -137,13 +149,25 @@ class OnlineFuserNode(Node):
                 f'Prediction time_from_start size mismatch, using fixed dt={dt:.6f}s'
             )
 
+        next_prediction = {
+            'skill_name': msg.skill_name,
+            'poses': list(msg.poses),
+            'times': times,
+            'confidence': float(msg.confidence),
+        }
+
         with self._lock:
-            self._active_prediction = {
-                'skill_name': msg.skill_name,
-                'poses': list(msg.poses),
-                'times': times,
-                'confidence': float(msg.confidence),
-            }
+            extend_in_place = (
+                self.progressive_update_enabled
+                and self.can_extend_prediction_in_place(next_prediction)
+            )
+            self._active_prediction = next_prediction
+            if extend_in_place:
+                self.get_logger().info(
+                    f'Extended online fusion trajectory in-place | poses={len(msg.poses)}'
+                )
+                return
+
             self._prediction_start_time = self.get_clock().now()
             self._running = True
 
@@ -152,6 +176,45 @@ class OnlineFuserNode(Node):
             f'Started online fusion | skill={msg.skill_name} | poses={len(msg.poses)} | '
             f'confidence={msg.confidence:.3f}'
         )
+
+    def can_extend_prediction_in_place(self, next_prediction):
+        """
+        Check whether a new prediction extends the active one without restart.
+
+        Args:
+            next_prediction: Normalized prediction dict with poses and times.
+
+        Returns:
+            True when the new trajectory is a longer prefix-compatible update.
+        """
+        current = self._active_prediction
+        if not self._running or current is None or self._prediction_start_time is None:
+            return False
+
+        current_poses = current['poses']
+        current_times = current['times']
+        next_poses = next_prediction['poses']
+        next_times = next_prediction['times']
+
+        if not current_poses or not current_times:
+            return False
+        if len(next_poses) <= len(current_poses):
+            return False
+        if len(current_times) != len(current_poses) or len(next_times) != len(next_poses):
+            return False
+
+        for i, current_pose in enumerate(current_poses):
+            next_pose = next_poses[i]
+            dx = current_pose.position.x - next_pose.position.x
+            dy = current_pose.position.y - next_pose.position.y
+            dz = current_pose.position.z - next_pose.position.z
+            pos_err = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if pos_err > self.progressive_match_pos_eps:
+                return False
+            if abs(current_times[i] - next_times[i]) > self.progressive_match_time_eps:
+                return False
+
+        return True
 
     def timer_callback(self):
         """
