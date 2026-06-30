@@ -319,6 +319,15 @@ class PredictionNode(Node):
                         f"Skipping predicted trajectory publish for seq={seq} because execution is running"
                     )
                     continue
+                if not pred.success:
+                    self.get_logger().info(
+                        f"Skipping predicted trajectory publish for seq={seq} because prediction was unsuccessful"
+                    )
+                    if self._save_csv:
+                        self._save_prediction_artifacts(
+                            self._make_output_paths(pred.success), pred, msg, seq
+                        )
+                    continue
 
                 self.pred_pub.publish(pred)
                 if self._save_csv:

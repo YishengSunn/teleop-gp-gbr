@@ -13,6 +13,7 @@ sys.path.append("/home/user/geo-gp")
 
 from config import Config
 from geometry.metrics import geom_mse
+from geometry.frame6d import estimate_rotation_scale_3d_search_by_count
 from geometry.resample import resample_trajectory_6d_equal_dt
 from gp.model import rollout_reference_6d
 from skills.skill_library import SkillLibrary
@@ -134,6 +135,15 @@ class Predictor:
 
         self.rollout_horizon = self.cfg.prediction["rollout_horizon"]
         self.mse_thresh = self.cfg.prediction["mse_thresh"]
+        self.skill_confidence_temperature = float(
+            self.cfg.prediction.get(
+                "skill_confidence_temperature",
+                max(self.mse_thresh, 1e-6),
+            )
+        )
+        self.skill_confidence_min = float(
+            self.cfg.prediction.get("skill_confidence_min", 0.5)
+        )
         self.goal_stop_eps = self.cfg.prediction["goal_stop_eps"]
         self.max_start_jump = self.cfg.prediction["max_start_jump"]
         self.drop_k = self.cfg.prediction["drop_k"]
@@ -245,6 +255,11 @@ class Predictor:
         skill_name="",
         success=True,
         confidence=1.0,
+        skill_confidence=1.0,
+        variance_mean=0.0,
+        variance_means=None,
+        chunk_error=0.0,
+        progress=0.0,
     ):
         """
         Convert a numpy array of predicted points to a ROS PredictedTrajectory message.
@@ -271,6 +286,12 @@ class Predictor:
         out.skill_name = skill_name
         out.success = success
         out.confidence = confidence
+        out.skill_confidence = skill_confidence
+        out.variance_mean = variance_mean
+        if variance_means is not None:
+            out.variance_means = [float(v) for v in variance_means]
+        out.chunk_error = chunk_error
+        out.progress = progress
 
         # Poses
         for i, p in enumerate(pts):
@@ -311,6 +332,67 @@ class Predictor:
                 out.time_from_start.append(t)
 
         return out
+
+    @staticmethod
+    def per_point_variance_means(vars_ref):
+        """
+        Compute the mean variance for each point in the predicted trajectory.
+
+        Args:
+            vars_ref (np.ndarray): A numpy array of shape (N, 3) containing the variance for each point in the predicted trajectory.
+
+        Returns:
+            list[float]: A list of mean variances for each point in the predicted trajectory.
+        """
+        arr = np.asarray(vars_ref, dtype=np.float64)
+        if arr.size == 0:
+            return []
+        if arr.ndim == 1:
+            return [float(v) for v in arr]
+        return [float(v) for v in np.mean(arr, axis=1)]
+
+    def match_skill_with_confidence(self, probe_eq: np.ndarray):
+        """
+        Match the input probe trajectory to the skill library 
+        and return the best matching skill along with its alignment parameters and confidence.
+
+        Args:
+            probe_eq (np.ndarray): The input probe trajectory as a numpy array of shape (N, 3).
+
+        Returns:
+            tuple: A tuple containing the best matching skill, 
+            its alignment parameters (R, s, t, j_end), the confidence in the match, 
+            and the RMSE of the match.
+        """
+        if len(self.skill_library.skills) == 0:
+            raise RuntimeError("SkillLibrary is empty")
+
+        matches = []
+        for skill in self.skill_library.skills:
+            ref_eq = skill.ref_eq
+            R, s, t, j_end, rmse = estimate_rotation_scale_3d_search_by_count(
+                ref_eq,
+                probe_eq,
+                margin_pts=1000,
+                step=15,
+            )[:5]
+            self.logger.info(f"[SkillMatch] {skill.name} rmse={rmse:.6f}")
+            matches.append((skill, (R, s, t, j_end), float(rmse)))
+
+        best_idx = int(np.argmin([m[2] for m in matches]))
+        rmses = np.asarray([m[2] for m in matches], dtype=np.float64)
+        temp = max(self.skill_confidence_temperature, 1e-9)
+        logits = -(rmses - float(np.min(rmses))) / temp
+        weights = np.exp(logits)
+        probs = weights / max(float(np.sum(weights)), 1e-12)
+        best_skill, best_align, best_rmse = matches[best_idx]
+        c_skill = float(probs[best_idx])
+
+        self.logger.info(
+            f"[SkillMatch] selected={best_skill.name} | rmse={best_rmse:.6f} | "
+            f"c_skill={c_skill:.3f}"
+        )
+        return best_skill, best_align, c_skill, best_rmse
 
     def prepare_prediction_context(self, prompt_msg: PromptTrajectory, predict_force: bool):
         target_speed = self.estimate_prompt_speed(prompt_msg)
@@ -359,13 +441,40 @@ class Predictor:
 
         # 2) Skill matching
         t_match_start = time.perf_counter()
-        skill, (R, s, t, j_end) = self.skill_library.match(probe_eq, margin_pts=1000, step=15)
+        skill, (R, s, t, j_end), c_skill, skill_rmse = self.match_skill_with_confidence(probe_eq)
         match_ms = (time.perf_counter() - t_match_start) * 1000.0
 
         ref_eq = skill.ref_eq
         model = skill.model
 
         self.logger.info(f"Matched skill: {skill.name} | matching={match_ms:.2f} ms")
+        if c_skill < self.skill_confidence_min:
+            self.logger.info(
+                f"[Predict] Skill confidence {c_skill:.3f} below min {self.skill_confidence_min:.3f}; skipping prediction"
+            )
+            self.last_prediction_context = {
+                "ok": False,
+                "reason": "low_skill_confidence",
+                "skill": skill,
+                "skill_confidence": c_skill,
+                "skill_rmse": skill_rmse,
+            }
+            return {
+                "ok": False,
+                "reason": "low_skill_confidence",
+                "predicted": self.numpy_to_predicted(
+                    prompt_msg,
+                    np.empty((0, 3), dtype=np.float64),
+                    None,
+                    None,
+                    target_speed=target_speed,
+                    skill_name=skill.name,
+                    success=False,
+                    confidence=c_skill,
+                    skill_confidence=c_skill,
+                    chunk_error=skill_rmse,
+                ),
+            }
 
         # 3) Transform to ref frame
         probe_in_ref = ((probe_eq - t) / s) @ R
@@ -382,6 +491,8 @@ class Predictor:
             "s": s,
             "t": t,
             "j_end": int(j_end),
+            "skill_confidence": c_skill,
+            "skill_rmse": skill_rmse,
             "ref_eq": ref_eq,
             "probe_eq": probe_eq,
             "probe_quat_eq": probe_quat_eq,
@@ -414,6 +525,8 @@ class Predictor:
         preds = None
         preds_quat = None
         preds_force = None
+        selected_vars_ref = None
+        accepted_chunk_error = self.mse_thresh
 
         rollout_h = self.rollout_horizon
         if rollout_horizon_override is not None:
@@ -505,6 +618,8 @@ class Predictor:
                     preds = preds_world_pos[i_start:]
                     preds_quat = preds_world_quat[i_start:]
                     preds_force = preds_world_force[i_start:] if preds_world_force is not None else None
+                    selected_vars_ref = np.asarray(vars_ref)[i_start:]
+                    accepted_chunk_error = float(mse_chunk)
                     break
 
             # Drop tail
@@ -551,6 +666,10 @@ class Predictor:
         )
 
         # 6) Numpy → ROS Path
+        variance_means = self.per_point_variance_means(selected_vars_ref)
+        variance_mean = float(np.mean(variance_means)) if variance_means else 0.0
+        progress = float(np.clip(float(ctx["j_end"]) / max(float(len(ref_eq)), 1.0), 0.0, 1.0))
+        c_skill = float(ctx.get("skill_confidence", 0.0))
         return self.numpy_to_predicted(
             ctx["prompt_msg"],
             preds,
@@ -559,7 +678,12 @@ class Predictor:
             target_speed=target_speed,
             skill_name=skill.name,
             success=True,
-            confidence=1.0,
+            confidence=c_skill,
+            skill_confidence=c_skill,
+            variance_mean=variance_mean,
+            variance_means=variance_means,
+            chunk_error=accepted_chunk_error,
+            progress=progress,
         )
 
     def predict(
@@ -570,7 +694,8 @@ class Predictor:
     ):
         ctx = self.prepare_prediction_context(prompt_msg, predict_force)
         if not ctx["ok"]:
-            self.logger.info("[Predict] Not enough probe points")
+            reason = ctx.get("reason", "not_enough_probe_points")
+            self.logger.info(f"[Predict] Context not ready: {reason}")
             return ctx["predicted"]
         return self.predict_from_context(
             ctx,
@@ -600,7 +725,8 @@ class Predictor:
     ):
         ctx = self.prepare_prediction_context(prompt_msg, predict_force)
         if not ctx["ok"]:
-            self.logger.info("[Predict] Not enough probe points")
+            reason = ctx.get("reason", "not_enough_probe_points")
+            self.logger.info(f"[Predict] Context not ready: {reason}")
             yield 1, 1, ctx["predicted"]
             return
 
@@ -624,6 +750,7 @@ class Predictor:
         accepted_world_pos = None
         accepted_world_quat = None
         accepted_world_force = None
+        accepted_vars_ref = None
 
         chunk_sizes = self.build_progressive_chunk_sizes(first_chunk_horizon, rollout_step)
         total = len(chunk_sizes)
@@ -700,6 +827,7 @@ class Predictor:
             new_world_pos = preds_world_pos[i_start:]
             new_world_quat = preds_world_quat[i_start:]
             new_world_force = preds_world_force[i_start:] if preds_world_force is not None else None
+            new_vars_ref = np.asarray(vars_ref)[i_start:i_start + len(new_world_pos)]
             if new_world_pos.shape[0] == 0:
                 self.logger.info("[Predict] Filtered chunk became empty, stop")
                 break
@@ -708,9 +836,11 @@ class Predictor:
                 accepted_world_pos = new_world_pos
                 accepted_world_quat = new_world_quat
                 accepted_world_force = new_world_force
+                accepted_vars_ref = new_vars_ref
             else:
                 accepted_world_pos = np.vstack([accepted_world_pos, new_world_pos])
                 accepted_world_quat = np.vstack([accepted_world_quat, new_world_quat])
+                accepted_vars_ref = np.concatenate([accepted_vars_ref, new_vars_ref])
                 if accepted_world_force is not None and new_world_force is not None:
                     accepted_world_force = np.vstack([accepted_world_force, new_world_force])
                 elif accepted_world_force is None:
@@ -729,7 +859,16 @@ class Predictor:
                 target_speed=target_speed,
                 skill_name=skill.name,
                 success=True,
-                confidence=1.0,
+                confidence=float(ctx.get("skill_confidence", 0.0)),
+                skill_confidence=float(ctx.get("skill_confidence", 0.0)),
+                variance_mean=(
+                    float(np.mean(self.per_point_variance_means(accepted_vars_ref)))
+                    if accepted_vars_ref is not None and np.asarray(accepted_vars_ref).size > 0
+                    else 0.0
+                ),
+                variance_means=self.per_point_variance_means(accepted_vars_ref),
+                chunk_error=float(mse_chunk),
+                progress=float(np.clip(float(ctx["j_end"]) / max(float(len(ref_eq)), 1.0), 0.0, 1.0)),
             )
             chunk_ms = (time.perf_counter() - t_chunk_start) * 1000.0
             self.logger.info(
