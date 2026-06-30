@@ -11,7 +11,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_trajectory_executor',
-            default_value='true',
+            default_value='false',
             description='Run trajectory_executor when true, otherwise run online_fuser.',
         ),
         Node(
@@ -25,7 +25,7 @@ def generate_launch_description():
                 "execution_running_topic": "/execution/running",
                 "blend_running_topic": "/execution/blend_to_leader_running",
                 "enabled_topic": "/geo_gp/enabled",
-                "online_mode": False,
+                "online_mode": True,
                 "publish_period_ms": 2000,
             }]
         ),
@@ -42,6 +42,7 @@ def generate_launch_description():
                 "execution_running_topic": "/execution/running",
                 "enabled_topic": "/geo_gp/enabled",
                 "force_enabled_topic": "/geo_gp/force_prediction_enabled",
+                "progressive_publish": True,
                 "save_csv": False,
                 "csv_output_dir": "/home/user/geo-gp/data/05-08/preds/arc1/arc1_1",
             }]
@@ -72,6 +73,7 @@ def generate_launch_description():
             parameters=[{
                 "prediction_topic": "/gp_predicted_trajectory",
                 "tdpa_pose_topic": "/tdpa/integrated_desired_pose",
+                "network_state_topic": "/leader/tdpa_cartesian_state_delayed",
                 "output_pose_topic": "/execution/desired_pose",
                 "running_topic": "/execution/running",
                 "rate": 200.0,
@@ -79,6 +81,24 @@ def generate_launch_description():
                 "confidence_gain": 1.0,
                 "min_prediction_weight": 0.0,
                 "max_prediction_weight": 1.0,
+                "network_k_delay": 1.0,
+                "network_delay_max": 0.2,
+                "network_k_jitter": 1.0,
+                "network_jitter_max": 0.05,
+                "network_w_delay": 0.5,
+                "network_w_jitter": 0.5,
+                "network_gamma": 1.0,
+                "gp_skill_min": 0.5,
+                "gp_k_sigma": 1.0,
+                "gp_k_chunk": 1.0,
+                "gp_error_fail": 0.1,
+                "gp_k_progress": 10.0,
+                "gp_progress_midpoint": 0.2,
+                "gp_w_sigma": 0.34,
+                "gp_w_chunk": 0.33,
+                "gp_w_progress": 0.33,
+                "gp_gamma": 1.0,
+                "authority_eps": 1e-6,
                 "progressive_update_enabled": True,
                 "progressive_match_pos_eps": 1e-3,
                 "progressive_match_time_eps": 1e-3,

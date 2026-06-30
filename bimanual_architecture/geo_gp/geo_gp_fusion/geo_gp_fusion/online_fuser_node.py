@@ -9,8 +9,9 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Bool, Float64MultiArray
+from rclpy.time import Time
 
-from geo_gp_interfaces.msg import PredictedTrajectory
+from geo_gp_interfaces.msg import PredictedTrajectory, TDPACartesianState
 from geo_gp_fusion.policies.linear_blend import blend_pose, clamp, sample_timed_pose
 
 
@@ -31,6 +32,7 @@ class OnlineFuserNode(Node):
 
         self.declare_parameter('prediction_topic', '/gp_predicted_trajectory_raw')
         self.declare_parameter('tdpa_pose_topic', '/tdpa/integrated_desired_pose')
+        self.declare_parameter('network_state_topic', '/leader/tdpa_cartesian_state_delayed')
         self.declare_parameter('output_pose_topic', '/execution/desired_pose')
         self.declare_parameter('running_topic', '/execution/running')
         self.declare_parameter('rate', 200.0)
@@ -38,12 +40,31 @@ class OnlineFuserNode(Node):
         self.declare_parameter('confidence_gain', 1.0)
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
+        self.declare_parameter('network_k_delay', 1.0)
+        self.declare_parameter('network_delay_max', 0.1)
+        self.declare_parameter('network_k_jitter', 1.0)
+        self.declare_parameter('network_jitter_max', 0.05)
+        self.declare_parameter('network_w_delay', 0.5)
+        self.declare_parameter('network_w_jitter', 0.5)
+        self.declare_parameter('network_gamma', 1.0)
+        self.declare_parameter('gp_skill_min', 0.5)
+        self.declare_parameter('gp_k_sigma', 1.0)
+        self.declare_parameter('gp_k_chunk', 1.0)
+        self.declare_parameter('gp_error_fail', 0.1)
+        self.declare_parameter('gp_k_progress', 10.0)
+        self.declare_parameter('gp_progress_midpoint', 0.2)
+        self.declare_parameter('gp_w_sigma', 0.34)
+        self.declare_parameter('gp_w_chunk', 0.33)
+        self.declare_parameter('gp_w_progress', 0.33)
+        self.declare_parameter('gp_gamma', 1.0)
+        self.declare_parameter('authority_eps', 1e-6)
         self.declare_parameter('progressive_update_enabled', True)
         self.declare_parameter('progressive_match_pos_eps', 1e-3)
         self.declare_parameter('progressive_match_time_eps', 1e-3)
 
         self.prediction_topic = self.get_parameter('prediction_topic').value
         self.tdpa_pose_topic = self.get_parameter('tdpa_pose_topic').value
+        self.network_state_topic = self.get_parameter('network_state_topic').value
         self.output_pose_topic = self.get_parameter('output_pose_topic').value
         self.running_topic = self.get_parameter('running_topic').value
         self.rate = float(self.get_parameter('rate').value)
@@ -51,6 +72,24 @@ class OnlineFuserNode(Node):
         self.confidence_gain = float(self.get_parameter('confidence_gain').value)
         self.min_prediction_weight = float(self.get_parameter('min_prediction_weight').value)
         self.max_prediction_weight = float(self.get_parameter('max_prediction_weight').value)
+        self.network_k_delay = float(self.get_parameter('network_k_delay').value)
+        self.network_delay_max = float(self.get_parameter('network_delay_max').value)
+        self.network_k_jitter = float(self.get_parameter('network_k_jitter').value)
+        self.network_jitter_max = float(self.get_parameter('network_jitter_max').value)
+        self.network_w_delay = float(self.get_parameter('network_w_delay').value)
+        self.network_w_jitter = float(self.get_parameter('network_w_jitter').value)
+        self.network_gamma = float(self.get_parameter('network_gamma').value)
+        self.gp_skill_min = float(self.get_parameter('gp_skill_min').value)
+        self.gp_k_sigma = float(self.get_parameter('gp_k_sigma').value)
+        self.gp_k_chunk = float(self.get_parameter('gp_k_chunk').value)
+        self.gp_error_fail = float(self.get_parameter('gp_error_fail').value)
+        self.gp_k_progress = float(self.get_parameter('gp_k_progress').value)
+        self.gp_progress_midpoint = float(self.get_parameter('gp_progress_midpoint').value)
+        self.gp_w_sigma = float(self.get_parameter('gp_w_sigma').value)
+        self.gp_w_chunk = float(self.get_parameter('gp_w_chunk').value)
+        self.gp_w_progress = float(self.get_parameter('gp_w_progress').value)
+        self.gp_gamma = float(self.get_parameter('gp_gamma').value)
+        self.authority_eps = float(self.get_parameter('authority_eps').value)
         self.progressive_update_enabled = bool(
             self.get_parameter('progressive_update_enabled').value
         )
@@ -64,6 +103,10 @@ class OnlineFuserNode(Node):
         self._lock = threading.Lock()
         self._latest_leader_pose = None
         self._latest_leader_stamp = None
+        self._latest_network_delay = None
+        self._latest_network_jitter = 0.0
+        self._previous_network_delay = None
+        self._network_state_received = False
         self._active_prediction = None
         self._prediction_start_time = None
         self._running = False
@@ -97,6 +140,12 @@ class OnlineFuserNode(Node):
             self.leader_pose_callback,
             best_effort_latest,
         )
+        self.network_state_sub = self.create_subscription(
+            TDPACartesianState,
+            self.network_state_topic,
+            self.network_state_callback,
+            best_effort_latest,
+        )
         self.pose_pub = self.create_publisher(
             Float64MultiArray,
             self.output_pose_topic,
@@ -111,7 +160,8 @@ class OnlineFuserNode(Node):
         self.get_logger().info(
             'Online fuser started | '
             f'prediction={self.prediction_topic} | tdpa_pose={self.tdpa_pose_topic} | '
-            f'output={self.output_pose_topic} | running={self.running_topic}'
+            f'network_state={self.network_state_topic} | output={self.output_pose_topic} | '
+            f'running={self.running_topic}'
         )
 
     def leader_pose_callback(self, msg):
@@ -121,9 +171,38 @@ class OnlineFuserNode(Node):
         Args:
             msg: Pose stamped by the TDPA controller publisher.
         """
+        now = self.get_clock().now()
+        delay = self.estimate_network_delay_from_stamp(now, msg.header.stamp)
         with self._lock:
             self._latest_leader_pose = msg.pose
-            self._latest_leader_stamp = self.get_clock().now()
+            self._latest_leader_stamp = now
+            if delay is not None and not self._network_state_received:
+                self._latest_network_delay = delay
+                if self._previous_network_delay is not None:
+                    self._latest_network_jitter = abs(delay - self._previous_network_delay)
+                self._previous_network_delay = delay
+
+    def network_state_callback(self, msg):
+        """
+        Update confidence inputs from measured TDPA round-trip delay.
+        
+        Args:
+            msg: TDPACartesianState message with echo_tx_time_ns and tx_time_ns    
+        """
+        now = self.get_clock().now()
+        delay = self.estimate_network_rtt_from_echo(now, msg.echo_tx_time_ns)
+        if delay is None:
+            delay = self.estimate_network_delay_from_tx_time(now, msg.tx_time_ns)
+        if delay is None:
+            delay = self.estimate_network_delay_from_stamp(now, msg.header.stamp)
+        if delay is None:
+            return
+        with self._lock:
+            self._network_state_received = True
+            self._latest_network_delay = delay
+            if self._previous_network_delay is not None:
+                self._latest_network_jitter = abs(delay - self._previous_network_delay)
+            self._previous_network_delay = delay
 
     def prediction_callback(self, msg):
         """
@@ -154,6 +233,11 @@ class OnlineFuserNode(Node):
             'poses': list(msg.poses),
             'times': times,
             'confidence': float(msg.confidence),
+            'skill_confidence': float(msg.skill_confidence),
+            'variance_mean': float(msg.variance_mean),
+            'variance_means': list(msg.variance_means),
+            'chunk_error': float(msg.chunk_error),
+            'progress': float(msg.progress),
         }
 
         with self._lock:
@@ -225,6 +309,8 @@ class OnlineFuserNode(Node):
             start_time = self._prediction_start_time
             leader_pose = self._latest_leader_pose
             leader_stamp = self._latest_leader_stamp
+            network_delay = self._latest_network_delay
+            network_jitter = self._latest_network_jitter
 
         if pred is None or start_time is None:
             return
@@ -255,23 +341,200 @@ class OnlineFuserNode(Node):
                 throttle_duration_sec=1.0,
             )
 
-        prediction_weight = self.prediction_weight(pred['confidence'])
+        variance_mean = self.sample_timed_value(
+            pred.get('variance_means', []),
+            times,
+            elapsed,
+            pred.get('variance_mean', 0.0),
+        )
+        prediction_weight = self.prediction_weight(
+            pred, network_delay, network_jitter, variance_mean
+        )
         fused_pose = blend_pose(predicted_pose, leader_pose, prediction_weight)
         self.publish_pose(fused_pose)
 
-    def prediction_weight(self, confidence):
+
+    def sample_timed_value(self, values, times, elapsed, default=0.0):
         """
-        Convert Geo-GP confidence into the prediction-side blend weight.
+        Sample a value from a time-indexed list of values.
 
         Args:
-            confidence: Confidence value from the prediction message.
+            values: List of values corresponding to the times.
+            times: List of time_from_start values for each value.
+            elapsed: Elapsed time in seconds since the prediction started.
+            default: Default value to return if sampling fails.
+
+        Returns:
+            The sampled value at the given elapsed time, or the default if unavailable.
+        """
+        if not values:
+            return default
+        if len(values) == 1 or not times:
+            return values[0]
+        n = min(len(values), len(times))
+        if n <= 0:
+            return default
+        if elapsed <= times[0]:
+            return values[0]
+        if elapsed >= times[n - 1]:
+            return values[n - 1]
+
+        hi = 1
+        while hi < n and times[hi] < elapsed:
+            hi += 1
+        lo = max(0, hi - 1)
+        if hi >= n:
+            return values[n - 1]
+        return values[lo] if elapsed - times[lo] <= times[hi] - elapsed else values[hi]
+
+    def estimate_network_delay_from_tx_time(self, now, tx_time_ns):
+        """
+        Estimate the one-way network delay from the leader's transmit timestamp.
+
+        Args:
+            now: Current ROS time.
+            tx_time_ns: Transmit time in nanoseconds from the leader.
+        
+        Returns:
+            Estimated one-way delay in seconds, or None if invalid.
+        """
+        if tx_time_ns <= 0:
+            return None
+        delay = (now.nanoseconds - int(tx_time_ns)) * 1e-9
+        if not math.isfinite(delay):
+            return None
+        return max(0.0, delay)
+
+    def estimate_network_rtt_from_echo(self, now, echo_tx_time_ns):
+        """
+        Estimate the round-trip time from the echo timestamp.
+        
+        Args:
+            now: Current ROS time.
+            echo_tx_time_ns: Echoed transmit time in nanoseconds from the leader.
+            
+        Returns:
+            Estimated round-trip time in seconds, or None if invalid.
+        """
+        if echo_tx_time_ns <= 0:
+            return None
+        rtt = (now.nanoseconds - int(echo_tx_time_ns)) * 1e-9
+        if not math.isfinite(rtt):
+            return None
+        return max(0.0, rtt)
+
+    def estimate_network_delay_from_stamp(self, now, stamp_msg):
+        """
+        Estimate the one-way network delay from a ROS time stamp.
+
+        Args:
+            now: Current ROS time.
+            stamp_msg: ROS time stamp message from the leader.
+
+        Returns:
+            Estimated one-way delay in seconds, or None if invalid.
+        """
+        stamp = Time.from_msg(stamp_msg)
+        if stamp.nanoseconds <= 0:
+            return None
+        delay = (now - stamp).nanoseconds * 1e-9
+        if not math.isfinite(delay):
+            return None
+        return max(0.0, delay)
+
+    def normalized_weights(self, *weights):
+        """
+        Normalize a list of weights to sum to 1.0, with non-negative values.
+
+        Args:
+            *weights: Variable number of weight values.
+
+        Returns:
+            List of normalized weights that sum to 1.0.
+        """
+        clean = [max(0.0, float(w)) if math.isfinite(float(w)) else 0.0 for w in weights]
+        total = sum(clean)
+        if total <= 1e-12:
+            return [1.0 / len(clean)] * len(clean)
+        return [w / total for w in clean]
+
+    def compute_network_confidence(self, delay, jitter):
+        """
+        Compute network confidence from delay and jitter metrics.
+        
+        Args:
+            delay: Latest leader/follower RTT estimate in seconds.
+            jitter: Latest RTT jitter estimate in seconds.
+            
+        Returns:
+            Network confidence in [0, 1], where 1 is best.
+        """
+        d_max = max(self.network_delay_max, 1e-9)
+        j_max = max(self.network_jitter_max, 1e-9)
+        D = max(0.0, float(delay)) if delay is not None and math.isfinite(delay) else d_max
+        J = max(0.0, float(jitter)) if jitter is not None and math.isfinite(jitter) else j_max
+        c_d = math.exp(-self.network_k_delay * D / d_max)
+        c_j = math.exp(-self.network_k_jitter * J / j_max)
+        w_d, w_j = self.normalized_weights(self.network_w_delay, self.network_w_jitter)
+        return (c_d ** w_d * c_j ** w_j) ** max(self.network_gamma, 0.0)
+
+    def compute_gp_confidence(self, pred, variance_mean=None):
+        """
+        Compute GP confidence from prediction metrics.
+
+        Args:
+            pred: Active prediction dict with confidence metrics.
+            variance_mean: Variance mean for the currently sampled prediction point.
+
+        Returns:
+            GP confidence in [0, 1], where 1 is best.
+        """
+        c_skill = pred.get('skill_confidence', pred.get('confidence', 0.0))
+        if not math.isfinite(c_skill):
+            c_skill = 0.0
+        c_skill = clamp(c_skill, 0.0, 1.0)
+        g_skill = 1.0 if c_skill >= self.gp_skill_min else 0.0
+
+        if variance_mean is None:
+            variance_mean = pred.get('variance_mean', 0.0)
+        variance_mean = max(0.0, float(variance_mean))
+        chunk_error = max(0.0, float(pred.get('chunk_error', 0.0)))
+        progress = float(pred.get('progress', 0.0))
+        if not math.isfinite(progress):
+            progress = 0.0
+
+        c_var = math.exp(-self.gp_k_sigma * variance_mean)
+        c_chunk = math.exp(
+            -self.gp_k_chunk * chunk_error / max(self.gp_error_fail, 1e-9)
+        )
+        c_prog = 1.0 / (
+            1.0 + math.exp(-self.gp_k_progress * (progress - self.gp_progress_midpoint))
+        )
+        w_sigma, w_c, w_rho = self.normalized_weights(
+            self.gp_w_sigma,
+            self.gp_w_chunk,
+            self.gp_w_progress,
+        )
+        return g_skill * (
+            c_var ** w_sigma * c_chunk ** w_c * c_prog ** w_rho
+        ) ** max(self.gp_gamma, 0.0)
+
+    def prediction_weight(self, pred, network_delay, network_jitter, variance_mean=None):
+        """
+        Compute GP authority alpha_G from network and GP confidence.
+
+        Args:
+            pred: Active prediction dict with confidence metrics.
+            network_delay: Latest leader/follower RTT estimate in seconds.
+            network_jitter: Latest RTT jitter estimate in seconds.
+            variance_mean: Variance mean for the currently sampled prediction point.
 
         Returns:
             Prediction weight clipped by configured min/max bounds.
         """
-        if not math.isfinite(confidence):
-            confidence = 0.0
-        weight = confidence * self.confidence_gain
+        c_net = self.compute_network_confidence(network_delay, network_jitter)
+        c_gp = self.compute_gp_confidence(pred, variance_mean) * self.confidence_gain
+        weight = c_gp / (c_net + c_gp + max(self.authority_eps, 1e-12))
         return clamp(weight, self.min_prediction_weight, self.max_prediction_weight)
 
     def publish_pose(self, pose):
