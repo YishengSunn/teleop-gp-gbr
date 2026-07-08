@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import math
 import torch
 import numpy as np
 from geo_gp_interfaces.msg import PromptTrajectory, PredictedTrajectory
@@ -140,6 +141,15 @@ class Predictor:
                 "skill_confidence_temperature",
                 max(self.mse_thresh, 1e-6),
             )
+        )
+        self.skill_confidence_mse_temperature = float(
+            self.cfg.prediction.get(
+                "skill_confidence_mse_temperature",
+                1e-3,
+            )
+        )
+        self.skill_confidence_ratio_temperature = float(
+            self.cfg.prediction.get("skill_confidence_ratio_temperature", 0.2)
         )
         self.skill_confidence_min = float(
             self.cfg.prediction.get("skill_confidence_min", 0.5)
@@ -367,7 +377,13 @@ class Predictor:
         if len(self.skill_library.skills) == 0:
             raise RuntimeError("SkillLibrary is empty")
 
-        matches = []
+        def skill_family(name: str) -> str:
+            parts = name.rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return parts[0]
+            return name
+
+        matches_by_family = {}
         for skill in self.skill_library.skills:
             ref_eq = skill.ref_eq
             R, s, t, j_end, rmse = estimate_rotation_scale_3d_search_by_count(
@@ -376,21 +392,49 @@ class Predictor:
                 margin_pts=1000,
                 step=15,
             )[:5]
-            self.logger.info(f"[SkillMatch] {skill.name} rmse={rmse:.6f}")
-            matches.append((skill, (R, s, t, j_end), float(rmse)))
+            rmse = float(rmse)
+            family = skill_family(skill.name)
+            self.logger.info(
+                f"[SkillMatch] {skill.name} family={family} rmse={rmse:.6f}"
+            )
+            match = (skill, (R, s, t, j_end), rmse)
+            if family not in matches_by_family or rmse < matches_by_family[family][2]:
+                matches_by_family[family] = match
 
-        best_idx = int(np.argmin([m[2] for m in matches]))
-        rmses = np.asarray([m[2] for m in matches], dtype=np.float64)
-        temp = max(self.skill_confidence_temperature, 1e-9)
-        logits = -(rmses - float(np.min(rmses))) / temp
-        weights = np.exp(logits)
-        probs = weights / max(float(np.sum(weights)), 1e-12)
-        best_skill, best_align, best_rmse = matches[best_idx]
-        c_skill = float(probs[best_idx])
+        ranked = sorted(matches_by_family.items(), key=lambda item: item[1][2])
+        best_family, (best_skill, best_align, best_rmse) = ranked[0]
+        best_mse = best_rmse ** 2
+
+        if len(ranked) > 1:
+            second_family, (_, _, second_rmse) = ranked[1]
+            second_mse = second_rmse ** 2
+            mse_gap = max(0.0, second_mse - best_mse)
+            mse_ratio = second_mse / max(best_mse, 1e-12)
+            c_gap = 1.0 - math.exp(
+                -mse_gap / max(self.skill_confidence_mse_temperature, 1e-12)
+            )
+            c_ratio = 1.0 - math.exp(
+                -max(0.0, mse_ratio - 1.0)
+                / max(self.skill_confidence_ratio_temperature, 1e-12)
+            )
+            c_skill = float(math.sqrt(max(0.0, c_gap * c_ratio)))
+        else:
+            second_family = None
+            second_rmse = math.inf
+            second_mse = math.inf
+            mse_gap = math.inf
+            mse_ratio = math.inf
+            c_gap = 1.0
+            c_ratio = 1.0
+            c_skill = 1.0
 
         self.logger.info(
-            f"[SkillMatch] selected={best_skill.name} | rmse={best_rmse:.6f} | "
-            f"c_skill={c_skill:.3f}"
+            f"[SkillMatch] selected={best_skill.name} family={best_family} | "
+            f"best_rmse={best_rmse:.6f} best_mse={best_mse:.8f} | "
+            f"second_family={second_family} second_rmse={second_rmse:.6f} "
+            f"second_mse={second_mse:.8f} | "
+            f"mse_gap={mse_gap:.8f} mse_ratio={mse_ratio:.3f} | "
+            f"c_gap={c_gap:.3f} c_ratio={c_ratio:.3f} c_skill={c_skill:.3f}"
         )
         return best_skill, best_align, c_skill, best_rmse
 
