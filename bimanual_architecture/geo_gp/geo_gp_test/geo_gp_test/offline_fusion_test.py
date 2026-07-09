@@ -64,7 +64,7 @@ class FusionConfig:
         authority_eps: Small denominator guard for authority computation.
         skill_confidence: Offline skill confidence value used for all samples.
         prediction_confidence: Fallback prediction confidence value.
-        variance_mean: Offline variance value used for all samples.
+        point_variance: Offline conservative point variance used for all samples.
         chunk_error: Offline chunk error value used for all samples.
         progress: Offline progress value used for all samples.
         network_delay: Offline network delay value used for all samples.
@@ -94,7 +94,7 @@ class FusionConfig:
     authority_eps: float
     skill_confidence: float
     prediction_confidence: float
-    variance_mean: float
+    point_variance: float
     chunk_error: float
     progress: float
     network_delay: float
@@ -109,8 +109,8 @@ class PredictionMetrics:
         skill_name: Skill/reference model selected for the saved prediction.
         prediction_confidence: Overall prediction confidence from the predictor.
         skill_confidence: Skill matching confidence from the predictor.
-        variance_mean: Mean GP variance over the reconstructed prediction.
-        variance_means: Per-point GP variance values aligned with prediction time.
+        trajectory_variance: Mean conservative point variance over the reconstructed prediction.
+        point_variances: Per-point conservative GP variance values aligned with prediction time.
         chunk_error: Geometric chunk error accepted by the predictor.
         progress: Matched progress along the reference trajectory.
         source: Human-readable source of the metrics.
@@ -119,8 +119,8 @@ class PredictionMetrics:
     skill_name: str
     prediction_confidence: float
     skill_confidence: float
-    variance_mean: float
-    variance_means: list
+    trajectory_variance: float
+    point_variances: list
     chunk_error: float
     progress: float
     source: str
@@ -195,11 +195,11 @@ def compute_gp_confidence(config):
     c_skill = clamp(c_skill, 0.0, 1.0)
     g_skill = 1.0 if c_skill >= config.gp_skill_min else 0.0
 
-    variance_mean = max(0.0, config.variance_mean)
+    point_variance = max(0.0, config.point_variance)
     chunk_error = max(0.0, config.chunk_error)
     progress = config.progress if math.isfinite(config.progress) else 0.0
 
-    c_var = math.exp(-config.gp_k_sigma * variance_mean)
+    c_var = math.exp(-config.gp_k_sigma * point_variance)
     c_chunk = math.exp(-config.gp_k_chunk * chunk_error / max(config.gp_error_fail, 1e-9))
     c_prog = 1.0 / (
         1.0 + math.exp(-config.gp_k_progress * (progress - config.gp_progress_midpoint))
@@ -489,8 +489,8 @@ def metrics_from_predicted(predicted, fallback_skill_name='', source='reference_
     Returns:
         PredictionMetrics used by the offline fuser.
     """
-    variance_means = [float(v) for v in predicted.variance_means]
-    variance_mean = (
+    point_variances = [float(v) for v in predicted.variance_means]
+    trajectory_variance = (
         float(predicted.variance_mean)
         if math.isfinite(float(predicted.variance_mean))
         else 0.0
@@ -499,8 +499,8 @@ def metrics_from_predicted(predicted, fallback_skill_name='', source='reference_
         skill_name=predicted.skill_name or fallback_skill_name,
         prediction_confidence=float(predicted.confidence),
         skill_confidence=float(predicted.skill_confidence),
-        variance_mean=variance_mean,
-        variance_means=variance_means,
+        trajectory_variance=trajectory_variance,
+        point_variances=point_variances,
         chunk_error=float(predicted.chunk_error),
         progress=float(predicted.progress),
         source=source,
@@ -520,8 +520,8 @@ def fixed_metrics(config):
         skill_name='',
         prediction_confidence=config.prediction_confidence,
         skill_confidence=config.skill_confidence,
-        variance_mean=config.variance_mean,
-        variance_means=[],
+        trajectory_variance=config.point_variance,
+        point_variances=[],
         chunk_error=config.chunk_error,
         progress=config.progress,
         source='fixed_parameters',
@@ -578,31 +578,31 @@ class OfflineFusionTestNode(Node):
         self.declare_parameter('confidence_gain', 1.0)
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
-        self.declare_parameter('network_k_delay', 1.0)
-        self.declare_parameter('network_delay_max', 0.1)
-        self.declare_parameter('network_k_jitter', 1.0)
+        self.declare_parameter('network_k_delay', 3.0)
+        self.declare_parameter('network_delay_max', 0.2)
+        self.declare_parameter('network_k_jitter', 3.0)
         self.declare_parameter('network_jitter_max', 0.05)
         self.declare_parameter('network_w_delay', 0.5)
         self.declare_parameter('network_w_jitter', 0.5)
         self.declare_parameter('network_gamma', 1.0)
-        self.declare_parameter('gp_skill_min', 0.25)
-        self.declare_parameter('gp_k_sigma', 1.0)
+        self.declare_parameter('gp_skill_min', 0.5)
+        self.declare_parameter('gp_k_sigma', 2.0)
         self.declare_parameter('gp_k_chunk', 1.0)
-        self.declare_parameter('gp_error_fail', 0.1)
+        self.declare_parameter('gp_error_fail', 0.01)
         self.declare_parameter('gp_k_progress', 10.0)
-        self.declare_parameter('gp_progress_midpoint', 0.2)
-        self.declare_parameter('gp_w_sigma', 0.34)
-        self.declare_parameter('gp_w_chunk', 0.33)
-        self.declare_parameter('gp_w_progress', 0.33)
+        self.declare_parameter('gp_progress_midpoint', 0.25)
+        self.declare_parameter('gp_w_sigma', 0.45)
+        self.declare_parameter('gp_w_chunk', 0.40)
+        self.declare_parameter('gp_w_progress', 0.15)
         self.declare_parameter('gp_gamma', 1.0)
         self.declare_parameter('authority_eps', 1e-6)
         self.declare_parameter('skill_confidence', 1.0)
         self.declare_parameter('prediction_confidence', 1.0)
-        self.declare_parameter('variance_mean', 0.0)
+        self.declare_parameter('point_variance', 0.0)
         self.declare_parameter('chunk_error', 0.0)
         self.declare_parameter('progress', 1.0)
-        self.declare_parameter('network_delay', 0.1)
-        self.declare_parameter('network_jitter', 0.05)
+        self.declare_parameter('network_delay', 0.0)
+        self.declare_parameter('network_jitter', 0.0)
 
     def config(self):
         """Read ROS parameters into a fusion configuration.
@@ -634,7 +634,7 @@ class OfflineFusionTestNode(Node):
             authority_eps=self.get_float('authority_eps'),
             skill_confidence=self.get_float('skill_confidence'),
             prediction_confidence=self.get_float('prediction_confidence'),
-            variance_mean=self.get_float('variance_mean'),
+            point_variance=self.get_float('point_variance'),
             chunk_error=self.get_float('chunk_error'),
             progress=self.get_float('progress'),
             network_delay=self.get_float('network_delay'),
@@ -970,17 +970,17 @@ class OfflineFusionTestNode(Node):
             elapsed = max(0.0, elapsed)
             predicted_pose = sample_timed_pose(prediction_poses, prediction_times, elapsed)
             leader_pose = sample_timed_pose(leader_poses, leader_times, elapsed)
-            variance_mean = sample_timed_value(
-                metrics.variance_means,
+            point_variance = sample_timed_value(
+                metrics.point_variances,
                 prediction_times,
                 elapsed,
-                metrics.variance_mean,
+                metrics.trajectory_variance,
             )
             sample_config = replace(
                 config,
                 prediction_confidence=metrics.prediction_confidence,
                 skill_confidence=metrics.skill_confidence,
-                variance_mean=variance_mean,
+                point_variance=point_variance,
                 chunk_error=metrics.chunk_error,
                 progress=metrics.progress,
             )

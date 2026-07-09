@@ -40,22 +40,22 @@ class OnlineFuserNode(Node):
         self.declare_parameter('confidence_gain', 1.0)
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
-        self.declare_parameter('network_k_delay', 1.0)
-        self.declare_parameter('network_delay_max', 0.1)
-        self.declare_parameter('network_k_jitter', 1.0)
+        self.declare_parameter('network_k_delay', 3.0)
+        self.declare_parameter('network_delay_max', 0.2)
+        self.declare_parameter('network_k_jitter', 3.0)
         self.declare_parameter('network_jitter_max', 0.05)
         self.declare_parameter('network_w_delay', 0.5)
         self.declare_parameter('network_w_jitter', 0.5)
         self.declare_parameter('network_gamma', 1.0)
         self.declare_parameter('gp_skill_min', 0.5)
-        self.declare_parameter('gp_k_sigma', 1.0)
+        self.declare_parameter('gp_k_sigma', 2.0)
         self.declare_parameter('gp_k_chunk', 1.0)
-        self.declare_parameter('gp_error_fail', 0.1)
+        self.declare_parameter('gp_error_fail', 0.01)
         self.declare_parameter('gp_k_progress', 10.0)
-        self.declare_parameter('gp_progress_midpoint', 0.2)
-        self.declare_parameter('gp_w_sigma', 0.34)
-        self.declare_parameter('gp_w_chunk', 0.33)
-        self.declare_parameter('gp_w_progress', 0.33)
+        self.declare_parameter('gp_progress_midpoint', 0.25)
+        self.declare_parameter('gp_w_sigma', 0.45)
+        self.declare_parameter('gp_w_chunk', 0.40)
+        self.declare_parameter('gp_w_progress', 0.15)
         self.declare_parameter('gp_gamma', 1.0)
         self.declare_parameter('authority_eps', 1e-6)
         self.declare_parameter('progressive_update_enabled', True)
@@ -234,8 +234,8 @@ class OnlineFuserNode(Node):
             'times': times,
             'confidence': float(msg.confidence),
             'skill_confidence': float(msg.skill_confidence),
-            'variance_mean': float(msg.variance_mean),
-            'variance_means': list(msg.variance_means),
+            'trajectory_variance': float(msg.variance_mean),
+            'point_variances': list(msg.variance_means),
             'chunk_error': float(msg.chunk_error),
             'progress': float(msg.progress),
         }
@@ -341,14 +341,14 @@ class OnlineFuserNode(Node):
                 throttle_duration_sec=1.0,
             )
 
-        variance_mean = self.sample_timed_value(
-            pred.get('variance_means', []),
+        point_variance = self.sample_timed_value(
+            pred.get('point_variances', []),
             times,
             elapsed,
-            pred.get('variance_mean', 0.0),
+            pred.get('trajectory_variance', 0.0),
         )
         prediction_weight = self.prediction_weight(
-            pred, network_delay, network_jitter, variance_mean
+            pred, network_delay, network_jitter, point_variance
         )
         fused_pose = blend_pose(predicted_pose, leader_pose, prediction_weight)
         self.publish_pose(fused_pose)
@@ -478,13 +478,13 @@ class OnlineFuserNode(Node):
         w_d, w_j = self.normalized_weights(self.network_w_delay, self.network_w_jitter)
         return (c_d ** w_d * c_j ** w_j) ** max(self.network_gamma, 0.0)
 
-    def compute_gp_confidence(self, pred, variance_mean=None):
+    def compute_gp_confidence(self, pred, point_variance=None):
         """
         Compute GP confidence from prediction metrics.
 
         Args:
             pred: Active prediction dict with confidence metrics.
-            variance_mean: Variance mean for the currently sampled prediction point.
+            point_variance: Conservative variance for the currently sampled prediction point.
 
         Returns:
             GP confidence in [0, 1], where 1 is best.
@@ -495,15 +495,15 @@ class OnlineFuserNode(Node):
         c_skill = clamp(c_skill, 0.0, 1.0)
         g_skill = 1.0 if c_skill >= self.gp_skill_min else 0.0
 
-        if variance_mean is None:
-            variance_mean = pred.get('variance_mean', 0.0)
-        variance_mean = max(0.0, float(variance_mean))
+        if point_variance is None:
+            point_variance = pred.get('trajectory_variance', 0.0)
+        point_variance = max(0.0, float(point_variance))
         chunk_error = max(0.0, float(pred.get('chunk_error', 0.0)))
         progress = float(pred.get('progress', 0.0))
         if not math.isfinite(progress):
             progress = 0.0
 
-        c_var = math.exp(-self.gp_k_sigma * variance_mean)
+        c_var = math.exp(-self.gp_k_sigma * point_variance)
         c_chunk = math.exp(
             -self.gp_k_chunk * chunk_error / max(self.gp_error_fail, 1e-9)
         )
@@ -519,7 +519,7 @@ class OnlineFuserNode(Node):
             c_var ** w_sigma * c_chunk ** w_c * c_prog ** w_rho
         ) ** max(self.gp_gamma, 0.0)
 
-    def prediction_weight(self, pred, network_delay, network_jitter, variance_mean=None):
+    def prediction_weight(self, pred, network_delay, network_jitter, point_variance=None):
         """
         Compute GP authority alpha_G from network and GP confidence.
 
@@ -527,13 +527,13 @@ class OnlineFuserNode(Node):
             pred: Active prediction dict with confidence metrics.
             network_delay: Latest leader/follower RTT estimate in seconds.
             network_jitter: Latest RTT jitter estimate in seconds.
-            variance_mean: Variance mean for the currently sampled prediction point.
+            point_variance: Conservative variance for the currently sampled prediction point.
 
         Returns:
             Prediction weight clipped by configured min/max bounds.
         """
         c_net = self.compute_network_confidence(network_delay, network_jitter)
-        c_gp = self.compute_gp_confidence(pred, variance_mean) * self.confidence_gain
+        c_gp = self.compute_gp_confidence(pred, point_variance) * self.confidence_gain
         weight = c_gp / (c_net + c_gp + max(self.authority_eps, 1e-12))
         return clamp(weight, self.min_prediction_weight, self.max_prediction_weight)
 
