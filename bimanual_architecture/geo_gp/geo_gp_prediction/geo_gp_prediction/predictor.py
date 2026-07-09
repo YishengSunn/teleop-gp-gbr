@@ -266,8 +266,8 @@ class Predictor:
         success=True,
         confidence=1.0,
         skill_confidence=1.0,
-        variance_mean=0.0,
-        variance_means=None,
+        trajectory_variance=0.0,
+        point_variances=None,
         chunk_error=0.0,
         progress=0.0,
     ):
@@ -297,9 +297,9 @@ class Predictor:
         out.success = success
         out.confidence = confidence
         out.skill_confidence = skill_confidence
-        out.variance_mean = variance_mean
-        if variance_means is not None:
-            out.variance_means = [float(v) for v in variance_means]
+        out.variance_mean = trajectory_variance
+        if point_variances is not None:
+            out.variance_means = [float(v) for v in point_variances]
         out.chunk_error = chunk_error
         out.progress = progress
 
@@ -344,22 +344,22 @@ class Predictor:
         return out
 
     @staticmethod
-    def per_point_variance_means(vars_ref):
+    def per_point_variances(vars_ref):
         """
-        Compute the mean variance for each point in the predicted trajectory.
+        Compute a conservative variance for each point in the predicted trajectory.
 
         Args:
             vars_ref (np.ndarray): A numpy array of shape (N, 3) containing the variance for each point in the predicted trajectory.
 
         Returns:
-            list[float]: A list of mean variances for each point in the predicted trajectory.
+            list[float]: A list of max variances across dimensions for each point.
         """
         arr = np.asarray(vars_ref, dtype=np.float64)
         if arr.size == 0:
             return []
         if arr.ndim == 1:
             return [float(v) for v in arr]
-        return [float(v) for v in np.mean(arr, axis=1)]
+        return [float(v) for v in np.max(arr, axis=1)]
 
     def match_skill_with_confidence(self, probe_eq: np.ndarray):
         """
@@ -710,8 +710,8 @@ class Predictor:
         )
 
         # 6) Numpy → ROS Path
-        variance_means = self.per_point_variance_means(selected_vars_ref)
-        variance_mean = float(np.mean(variance_means)) if variance_means else 0.0
+        point_variances = self.per_point_variances(selected_vars_ref)
+        trajectory_variance = float(np.mean(point_variances)) if point_variances else 0.0
         progress = float(np.clip(float(ctx["j_end"]) / max(float(len(ref_eq)), 1.0), 0.0, 1.0))
         c_skill = float(ctx.get("skill_confidence", 0.0))
         return self.numpy_to_predicted(
@@ -724,8 +724,8 @@ class Predictor:
             success=True,
             confidence=c_skill,
             skill_confidence=c_skill,
-            variance_mean=variance_mean,
-            variance_means=variance_means,
+            trajectory_variance=trajectory_variance,
+            point_variances=point_variances,
             chunk_error=accepted_chunk_error,
             progress=progress,
         )
@@ -905,12 +905,12 @@ class Predictor:
                 success=True,
                 confidence=float(ctx.get("skill_confidence", 0.0)),
                 skill_confidence=float(ctx.get("skill_confidence", 0.0)),
-                variance_mean=(
-                    float(np.mean(self.per_point_variance_means(accepted_vars_ref)))
+                trajectory_variance=(
+                    float(np.mean(self.per_point_variances(accepted_vars_ref)))
                     if accepted_vars_ref is not None and np.asarray(accepted_vars_ref).size > 0
                     else 0.0
                 ),
-                variance_means=self.per_point_variance_means(accepted_vars_ref),
+                point_variances=self.per_point_variances(accepted_vars_ref),
                 chunk_error=float(mse_chunk),
                 progress=float(np.clip(float(ctx["j_end"]) / max(float(len(ref_eq)), 1.0), 0.0, 1.0)),
             )
