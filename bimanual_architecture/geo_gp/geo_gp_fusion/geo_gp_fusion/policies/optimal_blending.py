@@ -1,4 +1,4 @@
-"""Scalar optimal arbitration for Human Leader-GP Autonomy shared control."""
+"""Optimal Human Leader-GP pose blending through scalar arbitration."""
 
 from dataclasses import dataclass
 import math
@@ -448,3 +448,60 @@ def optimal_prediction_weight(
         A=result.A,
         case=result.case,
     )
+
+
+def optimal_blend_pose(
+    predicted_pose,
+    leader_pose,
+    *,
+    c_net,
+    c_gp,
+    alpha_prev,
+    d,
+    lambda_s=0.0,
+    lambda_c=0.0,
+    g_skill=1.0,
+    confidence_gain=1.0,
+    min_prediction_weight=0.0,
+    max_prediction_weight=1.0,
+    authority_eps=1e-9,
+):
+    """Compute optimal GP authority and apply it to fuse two poses.
+
+    Args:
+        predicted_pose: Pose sampled from the GP predicted trajectory.
+        leader_pose: Latest human leader target pose.
+        c_net: Human/network confidence.
+        c_gp: GP confidence before optional gain.
+        alpha_prev: Previous GP authority.
+        d: Human-GP command conflict.
+        lambda_s: Smoothness penalty.
+        lambda_c: Conflict penalty.
+        g_skill: Binary GP skill gate.
+        confidence_gain: Gain applied to GP confidence.
+        min_prediction_weight: Lower bound for GP authority.
+        max_prediction_weight: Upper bound for GP authority.
+        authority_eps: Small solver denominator threshold.
+
+    Returns:
+        Tuple ``(fused_pose, arbitration)``. ``fused_pose`` is the pose blended
+        with the solved GP authority, and ``arbitration`` contains that authority
+        plus the solver branch metadata.
+    """
+    from geo_gp_fusion.policies.weighted_blending import blend_pose
+
+    arbitration = optimal_prediction_weight(
+        c_net=c_net,
+        c_gp=c_gp,
+        alpha_prev=alpha_prev,
+        d=d,
+        lambda_s=lambda_s,
+        lambda_c=lambda_c,
+        g_skill=g_skill,
+        confidence_gain=confidence_gain,
+        min_prediction_weight=min_prediction_weight,
+        max_prediction_weight=max_prediction_weight,
+        authority_eps=authority_eps,
+    )
+    fused_pose = blend_pose(predicted_pose, leader_pose, arbitration.alpha_g)
+    return fused_pose, arbitration

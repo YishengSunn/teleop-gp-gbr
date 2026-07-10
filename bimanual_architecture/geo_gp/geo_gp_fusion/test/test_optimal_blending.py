@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from geo_gp_fusion.policies.optimal_arbitration import (  # noqa: E402
+from geo_gp_fusion.policies.optimal_blending import (  # noqa: E402
     compute_gp_confidence,
     optimal_prediction_weight,
     pose_conflict,
