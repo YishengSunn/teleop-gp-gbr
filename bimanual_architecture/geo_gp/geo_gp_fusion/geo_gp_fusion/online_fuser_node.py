@@ -12,7 +12,7 @@ from std_msgs.msg import Bool, Float64MultiArray
 from rclpy.time import Time
 
 from geo_gp_interfaces.msg import PredictedTrajectory, TDPACartesianState
-from geo_gp_fusion.policies.linear_blend import blend_pose, clamp, sample_timed_pose
+from geo_gp_fusion.policies.weighted_blending import blend_pose, clamp, sample_timed_pose
 
 
 class OnlineFuserNode(Node):

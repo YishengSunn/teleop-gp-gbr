@@ -1,4 +1,4 @@
-"""Linear pose blending utilities for online Geo-GP fusion."""
+"""Weighted pose blending utilities for online Geo-GP fusion."""
 
 import copy
 import math
