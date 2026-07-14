@@ -15,7 +15,7 @@ from geo_gp_interfaces.msg import PromptTrajectory
 from geo_gp_prediction.predictor import Predictor
 from geometry.frame6d import estimate_rotation_scale_3d_search_by_count
 from geometry.resample import resample_by_arclen_fraction
-from geo_gp_fusion.policies.linear_blend import blend_pose, sample_timed_pose
+from geo_gp_fusion.policies.weighted_blending import blend_pose, sample_timed_pose
 
 
 POSE_FIELDS = ('time', 'x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')
