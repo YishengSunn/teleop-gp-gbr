@@ -13,6 +13,8 @@ from rclpy.time import Time
 
 from geo_gp_interfaces.msg import PredictedTrajectory, TDPACartesianState
 from geo_gp_fusion.policies.weighted_blending import blend_pose, clamp, sample_timed_pose
+from geo_gp_fusion.policies.optimal_blending import optimal_blend_pose, pose_conflict
+from geo_gp_fusion.policies.nash_blending import nash_blend_pose
 
 
 class OnlineFuserNode(Node):
@@ -38,6 +40,7 @@ class OnlineFuserNode(Node):
         self.declare_parameter('rate', 200.0)
         self.declare_parameter('leader_timeout_sec', 0.1)
         self.declare_parameter('confidence_gain', 1.0)
+        self.declare_parameter('fusion_policy', 'weighted_blending')
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
         self.declare_parameter('network_k_delay', 3.0)
@@ -58,6 +61,14 @@ class OnlineFuserNode(Node):
         self.declare_parameter('gp_w_progress', 0.15)
         self.declare_parameter('gp_gamma', 1.0)
         self.declare_parameter('authority_eps', 1e-6)
+        self.declare_parameter('optimal_lambda_s', 0.10)
+        self.declare_parameter('optimal_lambda_c', 0.05)
+        self.declare_parameter('nash_human_effort', 0.2)
+        self.declare_parameter('nash_gp_effort', 0.5)
+        self.declare_parameter('nash_human_agreement', 0.05)
+        self.declare_parameter('nash_gp_agreement', 0.10)
+        self.declare_parameter('nash_agreement_ratio', 0.7)
+        self.declare_parameter('nash_rotation_weight', 1.0)
         self.declare_parameter('progressive_update_enabled', True)
         self.declare_parameter('progressive_match_pos_eps', 1e-3)
         self.declare_parameter('progressive_match_time_eps', 1e-3)
@@ -70,6 +81,7 @@ class OnlineFuserNode(Node):
         self.rate = float(self.get_parameter('rate').value)
         self.leader_timeout_sec = float(self.get_parameter('leader_timeout_sec').value)
         self.confidence_gain = float(self.get_parameter('confidence_gain').value)
+        self.fusion_policy = self._normalize_fusion_policy(self.get_parameter('fusion_policy').value)
         self.min_prediction_weight = float(self.get_parameter('min_prediction_weight').value)
         self.max_prediction_weight = float(self.get_parameter('max_prediction_weight').value)
         self.network_k_delay = float(self.get_parameter('network_k_delay').value)
@@ -90,6 +102,14 @@ class OnlineFuserNode(Node):
         self.gp_w_progress = float(self.get_parameter('gp_w_progress').value)
         self.gp_gamma = float(self.get_parameter('gp_gamma').value)
         self.authority_eps = float(self.get_parameter('authority_eps').value)
+        self.optimal_lambda_s = float(self.get_parameter('optimal_lambda_s').value)
+        self.optimal_lambda_c = float(self.get_parameter('optimal_lambda_c').value)
+        self.nash_human_effort = float(self.get_parameter('nash_human_effort').value)
+        self.nash_gp_effort = float(self.get_parameter('nash_gp_effort').value)
+        self.nash_human_agreement = float(self.get_parameter('nash_human_agreement').value)
+        self.nash_gp_agreement = float(self.get_parameter('nash_gp_agreement').value)
+        self.nash_agreement_ratio = float(self.get_parameter('nash_agreement_ratio').value)
+        self.nash_rotation_weight = float(self.get_parameter('nash_rotation_weight').value)
         self.progressive_update_enabled = bool(
             self.get_parameter('progressive_update_enabled').value
         )
@@ -110,6 +130,8 @@ class OnlineFuserNode(Node):
         self._active_prediction = None
         self._prediction_start_time = None
         self._running = False
+        self._last_fused_pose = None
+        self._previous_optimal_weight = 0.0
 
         reliable_latest = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -161,8 +183,21 @@ class OnlineFuserNode(Node):
             'Online fuser started | '
             f'prediction={self.prediction_topic} | tdpa_pose={self.tdpa_pose_topic} | '
             f'network_state={self.network_state_topic} | output={self.output_pose_topic} | '
-            f'running={self.running_topic}'
+            f'running={self.running_topic} | fusion_policy={self.fusion_policy}'
         )
+
+    def _normalize_fusion_policy(self, value):
+        """Normalize the configured fusion policy name."""
+        aliases = {
+            'weighted': 'weighted_blending', 'weighted_blending': 'weighted_blending',
+            'optimal': 'optimal_blending', 'optimal_blending': 'optimal_blending',
+            'nash': 'nash_blending', 'nash_blending': 'nash_blending',
+        }
+        policy = aliases.get(str(value).strip().lower())
+        if policy is None:
+            self.get_logger().warn(f'Unknown fusion_policy={value!r}; falling back to weighted_blending')
+            return 'weighted_blending'
+        return policy
 
     def leader_pose_callback(self, msg):
         """
@@ -254,6 +289,7 @@ class OnlineFuserNode(Node):
 
             self._prediction_start_time = self.get_clock().now()
             self._running = True
+            self._previous_optimal_weight = 0.0
 
         self.publish_running(True)
         self.get_logger().info(
@@ -347,12 +383,53 @@ class OnlineFuserNode(Node):
             elapsed,
             pred.get('trajectory_variance', 0.0),
         )
-        prediction_weight = self.prediction_weight(
-            pred, network_delay, network_jitter, point_variance
+        fused_pose = self.fuse_pose(
+            predicted_pose, leader_pose, pred, network_delay, network_jitter,
+            point_variance,
         )
-        fused_pose = blend_pose(predicted_pose, leader_pose, prediction_weight)
+        self._last_fused_pose = fused_pose
         self.publish_pose(fused_pose)
 
+
+    def fuse_pose(
+        self, predicted_pose, leader_pose, pred, network_delay, network_jitter,
+        point_variance,
+    ):
+        """Fuse targets using the configured policy."""
+        if self.fusion_policy == 'weighted_blending':
+            return blend_pose(
+                predicted_pose, leader_pose,
+                self.prediction_weight(pred, network_delay, network_jitter, point_variance),
+            )
+
+        c_net = self.compute_network_confidence(network_delay, network_jitter)
+        c_gp = self.compute_gp_confidence(pred, point_variance)
+        g_skill = 1.0 if c_gp > 0.0 else 0.0
+        if self.fusion_policy == 'optimal_blending':
+            conflict = pose_conflict(leader_pose, predicted_pose) if leader_pose else 0.0
+            fused_pose, result = optimal_blend_pose(
+                predicted_pose, leader_pose, c_net=c_net, c_gp=c_gp,
+                alpha_prev=self._previous_optimal_weight, d=conflict,
+                lambda_s=self.optimal_lambda_s, lambda_c=self.optimal_lambda_c,
+                g_skill=g_skill, confidence_gain=self.confidence_gain,
+                min_prediction_weight=self.min_prediction_weight,
+                max_prediction_weight=self.max_prediction_weight,
+                authority_eps=self.authority_eps,
+            )
+            self._previous_optimal_weight = result.alpha_g
+            return fused_pose
+
+        current_pose = self._last_fused_pose or leader_pose or predicted_pose
+        fused_pose, _ = nash_blend_pose(
+            current_pose, predicted_pose, leader_pose, c_net=c_net, c_gp=c_gp,
+            g_skill=g_skill, confidence_gain=self.confidence_gain,
+            human_effort=self.nash_human_effort, gp_effort=self.nash_gp_effort,
+            human_agreement=self.nash_human_agreement,
+            gp_agreement=self.nash_gp_agreement,
+            agreement_ratio=self.nash_agreement_ratio,
+            rotation_weight=self.nash_rotation_weight, eps=self.authority_eps,
+        )
+        return fused_pose
 
     def sample_timed_value(self, values, times, elapsed, default=0.0):
         """
