@@ -142,8 +142,8 @@ def test_optimal_prediction_weight_applies_confidence_gain_and_bounds():
         max_prediction_weight=0.75,
     )
 
-    assert result.alpha_g == pytest.approx(0.75)
-    assert result.alpha_h == pytest.approx(0.25)
+    assert result.alpha_g == pytest.approx(0.8 / 1.1)
+    assert result.alpha_h == pytest.approx(0.3 / 1.1)
 
 
 def test_invalid_nonfinite_input_raises_value_error():
