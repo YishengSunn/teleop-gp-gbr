@@ -34,6 +34,7 @@ add_library(
   src/subscriber/gravity_compensation_with_joint_torque_feedback_controller.cpp
   src/subscriber/gravity_compensation_with_cartesian_force_feedback_controller.cpp
   src/tdpa/cartesian.cpp
+  src/tdpa/autonomy_passivity_controller.cpp
   src/tdpa/joint.cpp
 )
 

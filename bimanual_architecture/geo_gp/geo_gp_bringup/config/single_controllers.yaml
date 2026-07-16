@@ -418,6 +418,14 @@ follower:
       blend_duration_max: 8.0
       blend_running_hold_sec: 0.5
 
+      # APC is only applied while online_fuser publishes its active latch
+      autonomy_passivity_with_online_fuser: true
+      online_fuser_active_topic: "/execution/online_fuser_active"
+      autonomy_tank_initial_energy: 2.0
+      autonomy_tank_max_energy: 5.0
+      autonomy_tank_recharge_efficiency: 0.8
+      autonomy_wrench_max_abs: 100.0
+
   hybrid_position_force_controller:
     ros__parameters:
       arm_id: follower

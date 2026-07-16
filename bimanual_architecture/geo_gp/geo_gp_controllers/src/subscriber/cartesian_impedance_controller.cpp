@@ -491,8 +491,21 @@ CartesianImpedanceController::updateTdpa_(const rclcpp::Time& /*time*/,
     pose_error.head<3>() = pose_target - current_position;
     pose_error.tail<3>() = quatErrorToRotvec(current_orientation, orientation_target);
 
-    const Vector6d execution_wrench = stiffness_ * pose_error - damping_ * xdot_local_;
-    const Vector7d tau_task_execution = jacobian.transpose() * execution_wrench;
+    // Online_fuser supplies x_d. The TDPA-integrated reference remains x_L
+    const Vector6d f_total = stiffness_ * pose_error - damping_ * xdot_local_;
+    Vector6d f_cmd = f_total;
+    if (autonomy_passivity_with_online_fuser_ &&
+        online_fuser_active_.load(std::memory_order_acquire)) {
+      Vector6d leader_error = Vector6d::Zero();
+      leader_error.head<3>() = desired_position_ - current_position;
+      leader_error.tail<3>() =
+          quatErrorToRotvec(current_orientation, desired_orientation_);
+      const Vector6d f_leader = stiffness_ * leader_error - damping_ * xdot_local_;
+      const AutonomyPassivityOutput safe =
+          autonomy_pc_.update(f_leader, f_total, xdot_local_, dt);
+      f_cmd = f_leader + safe.wrench_autonomy_safe;
+    }
+    const Vector7d tau_task_execution = jacobian.transpose() * f_cmd;
     Eigen::MatrixXd jacobian_transpose_pinv;
     pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
     const Vector7d tau_nullspace_execution =
@@ -888,6 +901,12 @@ CartesianImpedanceController::on_init() {
     auto_declare<std::string>("remote_state_topic", "leader/tdpa_cartesian_state");
     auto_declare<std::string>("local_state_topic", "follower/tdpa_cartesian_state");
     auto_declare<std::string>("tdpa_integrated_pose_topic", "/tdpa/integrated_desired_pose");
+    auto_declare<bool>("autonomy_passivity_with_online_fuser", false);
+    auto_declare<std::string>("online_fuser_active_topic", "/execution/online_fuser_active");
+    auto_declare<double>("autonomy_tank_initial_energy", 2.0);
+    auto_declare<double>("autonomy_tank_max_energy", 5.0);
+    auto_declare<double>("autonomy_tank_recharge_efficiency", 0.8);
+    auto_declare<double>("autonomy_wrench_max_abs", 100.0);
 
   }
 
@@ -930,6 +949,19 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
   local_state_topic_ = get_node()->get_parameter("local_state_topic").as_string();
   tdpa_integrated_pose_topic_ =
       get_node()->get_parameter("tdpa_integrated_pose_topic").as_string();
+  autonomy_passivity_with_online_fuser_ =
+      get_node()->get_parameter("autonomy_passivity_with_online_fuser").as_bool();
+  online_fuser_active_topic_ =
+      get_node()->get_parameter("online_fuser_active_topic").as_string();
+  autonomy_passivity_params_.tank.initial_energy =
+      get_node()->get_parameter("autonomy_tank_initial_energy").as_double();
+  autonomy_passivity_params_.tank.max_energy =
+      get_node()->get_parameter("autonomy_tank_max_energy").as_double();
+  autonomy_passivity_params_.tank.recharge_efficiency =
+      get_node()->get_parameter("autonomy_tank_recharge_efficiency").as_double();
+  autonomy_passivity_params_.tank.wrench_max_abs =
+      get_node()->get_parameter("autonomy_wrench_max_abs").as_double();
+  autonomy_pc_.configure(autonomy_passivity_params_);
 
   move_to_start_ = get_node()->get_parameter("move_to_start").as_bool();
   const auto start_q = get_node()->get_parameter("start_joint_configuration").as_double_array();
@@ -1025,6 +1057,12 @@ CartesianImpedanceController::on_configure(const rclcpp_lifecycle::State& /*prev
           std::bind(&CartesianImpedanceController::executionRunningCallback, this,
                     std::placeholders::_1));
 
+  sub_online_fuser_active_ =
+      get_node()->create_subscription<std_msgs::msg::Bool>(
+          online_fuser_active_topic_, rclcpp::QoS(1).transient_local(),
+          std::bind(&CartesianImpedanceController::onlineFuserActiveCallback, this,
+                    std::placeholders::_1));
+
   pub_blend_running_ = get_node()->create_publisher<std_msgs::msg::Bool>(
       blend_running_topic_, rclcpp::QoS(1).transient_local());
 
@@ -1075,6 +1113,7 @@ CartesianImpedanceController::on_activate(const rclcpp_lifecycle::State& /*previ
   blending_to_leader_.store(false, std::memory_order_release);
   blend_running_hold_until_ = this->get_node()->now();
   last_blend_running_published_ = false;
+  autonomy_pc_.reset();
   if (pub_blend_running_) {
     std_msgs::msg::Bool msg;
     msg.data = false;
@@ -1288,6 +1327,11 @@ void CartesianImpedanceController::executionRunningCallback(
     pending_blend_to_leader_.store(true, std::memory_order_release);
   }
   execution_running_.store(now, std::memory_order_release);
+}
+
+void CartesianImpedanceController::onlineFuserActiveCallback(
+    const std_msgs::msg::Bool::SharedPtr msg) {
+  online_fuser_active_.store(msg && msg->data, std::memory_order_release);
 }
 
 Quaterniond CartesianImpedanceController::quatFromDesiredPose(const DesiredPoseRT& p) {

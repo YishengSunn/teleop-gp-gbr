@@ -1,6 +1,7 @@
 #pragma once
 
 #include "geo_gp_controllers/comless/motion_generator.hpp"
+#include "geo_gp_controllers/tdpa/autonomy_passivity_controller.hpp"
 #include "geo_gp_controllers/tdpa/cartesian.h"
 
 #include <array>
@@ -129,6 +130,12 @@ private:
   double blend_duration_max_{8.0};
   double blend_running_hold_sec_{0.5};
 
+  bool autonomy_passivity_with_online_fuser_{false};
+  std::string online_fuser_active_topic_{"/execution/online_fuser_active"};
+  std::atomic<bool> online_fuser_active_{false};
+  AutonomyPassivityParameters autonomy_passivity_params_{};
+  AutonomyPassivityController autonomy_pc_{};
+
   double pos_stiff_{100.0};
   double rot_stiff_{10.0};
   double n_stiffness_{10.0};
@@ -245,12 +252,14 @@ private:
   void leaderRobotStateCallback(const franka_msgs::msg::FrankaState& msg);
   void executionDesiredPoseCallback(const std_msgs::msg::Float64MultiArray& msg);
   void executionRunningCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void onlineFuserActiveCallback(const std_msgs::msg::Bool::SharedPtr msg);
 
   static Quaterniond quatFromDesiredPose(const DesiredPoseRT& p);
   static void desiredPoseFromQuaternion(const Quaterniond& q, DesiredPoseRT* out);
   rclcpp::Subscription<franka_msgs::msg::FrankaState>::SharedPtr sub_leader_robot_state_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_execution_pose_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_execution_running_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_online_fuser_active_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_blend_running_;
   bool last_blend_running_published_{false};
 };

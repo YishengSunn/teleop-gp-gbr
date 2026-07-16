@@ -16,6 +16,8 @@ from geo_gp_prediction.predictor import Predictor
 from geometry.frame6d import estimate_rotation_scale_3d_search_by_count
 from geometry.resample import resample_by_arclen_fraction
 from geo_gp_fusion.policies.weighted_blending import blend_pose, sample_timed_pose
+from geo_gp_fusion.policies.optimal_blending import optimal_blend_pose, pose_conflict
+from geo_gp_fusion.policies.nash_blending import nash_blend_pose
 
 
 POSE_FIELDS = ('time', 'x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')
@@ -34,6 +36,7 @@ class TimedPose:
     time: float
     pose: Pose
     alpha: float = None
+    autonomy_level: float = None
 
 
 @dataclass
@@ -63,7 +66,6 @@ class FusionConfig:
         gp_gamma: Global exponent applied to GP confidence.
         authority_eps: Small denominator guard for authority computation.
         skill_confidence: Offline skill confidence value used for all samples.
-        prediction_confidence: Fallback prediction confidence value.
         point_variance: Offline conservative point variance used for all samples.
         chunk_error: Offline chunk error value used for all samples.
         progress: Offline progress value used for all samples.
@@ -93,12 +95,69 @@ class FusionConfig:
     gp_gamma: float
     authority_eps: float
     skill_confidence: float
-    prediction_confidence: float
     point_variance: float
     chunk_error: float
     progress: float
     network_delay: float
     network_jitter: float
+    rate: float
+    leader_timeout_sec: float
+    fusion_policy: str
+    optimal_lambda_s: float
+    optimal_lambda_c: float
+    nash_human_effort: float
+    nash_gp_effort: float
+    nash_human_agreement: float
+    nash_gp_agreement: float
+    nash_agreement_ratio: float
+    nash_rotation_weight: float
+    autonomy_alpha_time_constant: float
+    autonomy_alpha_rate_limit: float
+
+
+class AutonomyPassivityController:
+    """Pose-only equivalent of the controller-side autonomy alpha conditioner.
+
+    The C++ energy tank constrains Cartesian wrenches, which cannot be
+    reconstructed from pose-only CSV files. Its alpha conditioner is reproduced
+    here so the saved autonomy level matches the requested controller behavior.
+
+    Args:
+        alpha_time_constant: Time constant in seconds for alpha smoothing.
+        alpha_rate_limit: Maximum alpha change per second. Non-positive values
+            disable rate limiting.
+    """
+
+    def __init__(self, alpha_time_constant=0.05, alpha_rate_limit=2.0):
+        self.alpha_time_constant = float(alpha_time_constant)
+        self.alpha_rate_limit = float(alpha_rate_limit)
+        self.alpha = 0.0
+
+    def update_alpha(self, alpha_requested, dt):
+        """Filter and rate-limit a requested autonomy level.
+
+        Args:
+            alpha_requested: Raw requested autonomy in the range ``[0, 1]``.
+            dt: Time step in seconds since the previous update.
+
+        Returns:
+            Passivity-controller-conditioned autonomy level in ``[0, 1]``.
+        """
+        requested = clamp(
+            float(alpha_requested) if math.isfinite(float(alpha_requested)) else 0.0,
+            0.0,
+            1.0,
+        )
+        safe_dt = float(dt) if math.isfinite(float(dt)) and dt > 0.0 else 0.0
+        target = requested
+        if self.alpha_time_constant > 0.0 and safe_dt > 0.0:
+            beta = safe_dt / (self.alpha_time_constant + safe_dt)
+            target = self.alpha + beta * (requested - self.alpha)
+        if self.alpha_rate_limit > 0.0 and safe_dt > 0.0:
+            delta = self.alpha_rate_limit * safe_dt
+            target = clamp(target, self.alpha - delta, self.alpha + delta)
+        self.alpha = clamp(target, 0.0, 1.0)
+        return self.alpha
 
 
 @dataclass
@@ -107,7 +166,6 @@ class PredictionMetrics:
 
     Attributes:
         skill_name: Skill/reference model selected for the saved prediction.
-        prediction_confidence: Overall prediction confidence from the predictor.
         skill_confidence: Skill matching confidence from the predictor.
         trajectory_variance: Mean conservative point variance over the reconstructed prediction.
         point_variances: Per-point conservative GP variance values aligned with prediction time.
@@ -117,7 +175,6 @@ class PredictionMetrics:
     """
 
     skill_name: str
-    prediction_confidence: float
     skill_confidence: float
     trajectory_variance: float
     point_variances: list
@@ -155,113 +212,6 @@ def normalized_weights(*weights):
     if total <= 1e-12:
         return [1.0 / len(clean)] * len(clean)
     return [w / total for w in clean]
-
-
-def compute_network_confidence(config):
-    """Compute the network confidence used by the online fuser.
-
-    Args:
-        config: Offline fusion configuration containing delay, jitter, and
-            network confidence parameters.
-
-    Returns:
-        Network confidence in ``[0, 1]``. Larger values mean the live leader
-        signal is considered more reliable.
-    """
-    d_max = max(config.network_delay_max, 1e-9)
-    j_max = max(config.network_jitter_max, 1e-9)
-    delay = max(0.0, config.network_delay)
-    jitter = max(0.0, config.network_jitter)
-    c_d = math.exp(-config.network_k_delay * delay / d_max)
-    c_j = math.exp(-config.network_k_jitter * jitter / j_max)
-    w_d, w_j = normalized_weights(config.network_w_delay, config.network_w_jitter)
-    return (c_d ** w_d * c_j ** w_j) ** max(config.network_gamma, 0.0)
-
-
-def compute_gp_confidence(config):
-    """Compute the GP confidence used by the online fuser.
-
-    Args:
-        config: Offline fusion configuration containing GP confidence inputs and
-            their weighting parameters.
-
-    Returns:
-        GP confidence in ``[0, 1]``. Larger values mean the predicted trajectory
-        is considered more reliable.
-    """
-    c_skill = config.skill_confidence
-    if not math.isfinite(c_skill):
-        c_skill = config.prediction_confidence
-    c_skill = clamp(c_skill, 0.0, 1.0)
-    g_skill = 1.0 if c_skill >= config.gp_skill_min else 0.0
-
-    point_variance = max(0.0, config.point_variance)
-    chunk_error = max(0.0, config.chunk_error)
-    progress = config.progress if math.isfinite(config.progress) else 0.0
-
-    c_var = math.exp(-config.gp_k_sigma * point_variance)
-    c_chunk = math.exp(-config.gp_k_chunk * chunk_error / max(config.gp_error_fail, 1e-9))
-    c_prog = 1.0 / (
-        1.0 + math.exp(-config.gp_k_progress * (progress - config.gp_progress_midpoint))
-    )
-    w_sigma, w_chunk, w_progress = normalized_weights(
-        config.gp_w_sigma,
-        config.gp_w_chunk,
-        config.gp_w_progress,
-    )
-    return g_skill * (
-        c_var ** w_sigma * c_chunk ** w_chunk * c_prog ** w_progress
-    ) ** max(config.gp_gamma, 0.0)
-
-
-def sample_timed_value(values, times, elapsed, default=0.0):
-    """Sample a scalar value from a time-indexed trajectory.
-
-    Args:
-        values: Scalar samples aligned with ``times``.
-        times: Monotonic time-from-start samples.
-        elapsed: Query time in seconds from trajectory start.
-        default: Value returned when sampling is not possible.
-
-    Returns:
-        Nearest scalar sample at ``elapsed``.
-    """
-    if not values:
-        return default
-    if len(values) == 1 or not times:
-        return values[0]
-    n = min(len(values), len(times))
-    if n <= 0:
-        return default
-    if elapsed <= times[0]:
-        return values[0]
-    if elapsed >= times[n - 1]:
-        return values[n - 1]
-
-    hi = 1
-    while hi < n and times[hi] < elapsed:
-        hi += 1
-    lo = max(0, hi - 1)
-    if hi >= n:
-        return values[n - 1]
-    return values[lo] if elapsed - times[lo] <= times[hi] - elapsed else values[hi]
-
-
-def prediction_weight(config):
-    """Compute the GP authority ``alpha_G`` used by the online fuser.
-
-    Args:
-        config: Offline fusion configuration.
-
-    Returns:
-        Prediction weight clipped to ``[min_prediction_weight,
-        max_prediction_weight]``. A value of 0.0 chooses the leader pose; a
-        value of 1.0 chooses the predicted pose.
-    """
-    c_net = compute_network_confidence(config)
-    c_gp = compute_gp_confidence(config) * config.confidence_gain
-    weight = c_gp / (c_net + c_gp + max(config.authority_eps, 1e-12))
-    return clamp(weight, config.min_prediction_weight, config.max_prediction_weight)
 
 
 def expand_path(path_text):
@@ -368,13 +318,16 @@ def write_trajectory(csv_path, samples):
         csv_path: Destination CSV path.
         samples: Timed fused poses to write.
 
-    The output uses the prediction trajectory format plus ``alpha`` when the
-    samples include prediction authority values:
-    ``time,x,y,z,qx,qy,qz,qw,alpha``.
+    The output uses the prediction trajectory format plus the requested fusion
+    authority and the passivity-conditioned autonomy level:
+    ``time,x,y,z,qx,qy,qz,qw,alpha,autonomy_level``.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     has_alpha = any(sample.alpha is not None for sample in samples)
-    fieldnames = POSE_FIELDS + (('alpha',) if has_alpha else ())
+    has_autonomy_level = any(sample.autonomy_level is not None for sample in samples)
+    fieldnames = POSE_FIELDS + (('alpha',) if has_alpha else ()) + (
+        ('autonomy_level',) if has_autonomy_level else ()
+    )
     with csv_path.open('w', newline='') as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
@@ -391,8 +344,11 @@ def write_trajectory(csv_path, samples):
                 'qw': f'{pose.orientation.w:.6f}',
             }
             if has_alpha:
-                row['alpha'] = (
-                    f'{sample.alpha:.6f}' if sample.alpha is not None else ''
+                row['alpha'] = f'{sample.alpha:.6f}' if sample.alpha is not None else ''
+            if has_autonomy_level:
+                row['autonomy_level'] = (
+                    f'{sample.autonomy_level:.6f}'
+                    if sample.autonomy_level is not None else ''
                 )
             writer.writerow(row)
 
@@ -497,7 +453,6 @@ def metrics_from_predicted(predicted, fallback_skill_name='', source='reference_
     )
     return PredictionMetrics(
         skill_name=predicted.skill_name or fallback_skill_name,
-        prediction_confidence=float(predicted.confidence),
         skill_confidence=float(predicted.skill_confidence),
         trajectory_variance=trajectory_variance,
         point_variances=point_variances,
@@ -518,7 +473,6 @@ def fixed_metrics(config):
     """
     return PredictionMetrics(
         skill_name='',
-        prediction_confidence=config.prediction_confidence,
         skill_confidence=config.skill_confidence,
         trajectory_variance=config.point_variance,
         point_variances=[],
@@ -597,12 +551,29 @@ class OfflineFusionTestNode(Node):
         self.declare_parameter('gp_gamma', 1.0)
         self.declare_parameter('authority_eps', 1e-6)
         self.declare_parameter('skill_confidence', 1.0)
-        self.declare_parameter('prediction_confidence', 1.0)
         self.declare_parameter('point_variance', 0.0)
         self.declare_parameter('chunk_error', 0.0)
         self.declare_parameter('progress', 1.0)
         self.declare_parameter('network_delay', 0.0)
         self.declare_parameter('network_jitter', 0.0)
+        # Keep these defaults aligned with OnlineFuserNode
+        self.declare_parameter('rate', 200.0)
+        self.declare_parameter('leader_timeout_sec', 0.1)
+        self.declare_parameter('fusion_policy', 'weighted_blending')
+        self.declare_parameter('optimal_lambda_s', 0.10)
+        self.declare_parameter('optimal_lambda_c', 0.05)
+        self.declare_parameter('nash_human_effort', 0.2)
+        self.declare_parameter('nash_gp_effort', 0.5)
+        self.declare_parameter('nash_human_agreement', 0.05)
+        self.declare_parameter('nash_gp_agreement', 0.10)
+        self.declare_parameter('nash_agreement_ratio', 0.7)
+        self.declare_parameter('nash_rotation_weight', 1.0)
+        # Same defaults as AutonomyPassivityParameters in the C++ controller
+        self.declare_parameter('autonomy_alpha_time_constant', 0.05)
+        self.declare_parameter('autonomy_alpha_rate_limit', 2.0)
+        self._filtered_prediction_weight = 0.0
+        self._previous_optimal_weight = 0.0
+        self._last_fused_pose = None
 
     def config(self):
         """Read ROS parameters into a fusion configuration.
@@ -633,13 +604,48 @@ class OfflineFusionTestNode(Node):
             gp_gamma=self.get_float('gp_gamma'),
             authority_eps=self.get_float('authority_eps'),
             skill_confidence=self.get_float('skill_confidence'),
-            prediction_confidence=self.get_float('prediction_confidence'),
             point_variance=self.get_float('point_variance'),
             chunk_error=self.get_float('chunk_error'),
             progress=self.get_float('progress'),
             network_delay=self.get_float('network_delay'),
             network_jitter=self.get_float('network_jitter'),
+            rate=self.get_float('rate'),
+            leader_timeout_sec=self.get_float('leader_timeout_sec'),
+            fusion_policy=self.normalize_fusion_policy(self.get_string('fusion_policy')),
+            optimal_lambda_s=self.get_float('optimal_lambda_s'),
+            optimal_lambda_c=self.get_float('optimal_lambda_c'),
+            nash_human_effort=self.get_float('nash_human_effort'),
+            nash_gp_effort=self.get_float('nash_gp_effort'),
+            nash_human_agreement=self.get_float('nash_human_agreement'),
+            nash_gp_agreement=self.get_float('nash_gp_agreement'),
+            nash_agreement_ratio=self.get_float('nash_agreement_ratio'),
+            nash_rotation_weight=self.get_float('nash_rotation_weight'),
+            autonomy_alpha_time_constant=self.get_float('autonomy_alpha_time_constant'),
+            autonomy_alpha_rate_limit=self.get_float('autonomy_alpha_rate_limit'),
         )
+
+    def normalize_fusion_policy(self, value):
+        """Normalize a configured fusion policy name.
+
+        Args:
+            value: Configured fusion policy or alias.
+
+        Returns:
+            One of ``weighted_blending``, ``optimal_blending``, or
+            ``nash_blending``. Unknown values fall back to weighted blending.
+        """
+        aliases = {
+            'weighted': 'weighted_blending', 'weighted_blending': 'weighted_blending',
+            'optimal': 'optimal_blending', 'optimal_blending': 'optimal_blending',
+            'nash': 'nash_blending', 'nash_blending': 'nash_blending',
+        }
+        policy = aliases.get(str(value).strip().lower())
+        if policy is None:
+            self.get_logger().warn(
+                f'Unknown fusion_policy={value!r}; falling back to weighted_blending'
+            )
+            return 'weighted_blending'
+        return policy
 
     def get_float(self, name):
         """Read a ROS parameter as a float.
@@ -915,7 +921,7 @@ class OfflineFusionTestNode(Node):
                 self.get_logger().info(f'Skipping existing output: {output_path}')
                 continue
 
-            count, min_alpha, max_alpha = self.fuse_trial(
+            count, min_alpha, max_alpha, min_autonomy, max_autonomy = self.fuse_trial(
                 prediction_path,
                 leader_path,
                 output_path,
@@ -926,10 +932,172 @@ class OfflineFusionTestNode(Node):
             wrote += 1
             self.get_logger().info(
                 f'Wrote {count} fused samples | alpha_G=[{min_alpha:.3f}, {max_alpha:.3f}] | '
+                f'autonomy_level=[{min_autonomy:.3f}, {max_autonomy:.3f}] | '
                 f'metrics={metrics.source} | skill={metrics.skill_name} | {output_path}'
             )
 
         self.get_logger().info(f'Offline fusion complete: {wrote} file(s) written')
+
+    def compute_network_confidence(self, config):
+        """Compute leader/network confidence using the online fuser formula.
+
+        Args:
+            config: Fusion configuration containing network confidence inputs.
+
+        Returns:
+            Network confidence in the range ``[0, 1]``.
+        """
+        d_max = max(config.network_delay_max, 1e-9)
+        j_max = max(config.network_jitter_max, 1e-9)
+        delay = (
+            max(0.0, float(config.network_delay))
+            if math.isfinite(float(config.network_delay)) else d_max
+        )
+        jitter = (
+            max(0.0, float(config.network_jitter))
+            if math.isfinite(float(config.network_jitter)) else j_max
+        )
+        c_d = math.exp(-config.network_k_delay * delay / d_max)
+        c_j = math.exp(-config.network_k_jitter * jitter / j_max)
+        w_d, w_j = normalized_weights(config.network_w_delay, config.network_w_jitter)
+        return (c_d ** w_d * c_j ** w_j) ** max(config.network_gamma, 0.0)
+
+    def compute_gp_confidence(self, config):
+        """Compute GP confidence using the online fuser formula.
+
+        Args:
+            config: Fusion configuration containing prediction confidence inputs.
+
+        Returns:
+            GP confidence in the range ``[0, 1]``.
+        """
+        c_skill = config.skill_confidence
+        if not math.isfinite(c_skill):
+            c_skill = 0.0
+        c_skill = clamp(c_skill, 0.0, 1.0)
+        g_skill = 1.0 if c_skill >= config.gp_skill_min else 0.0
+        c_var = math.exp(-config.gp_k_sigma * max(0.0, config.point_variance))
+        c_chunk = math.exp(
+            -config.gp_k_chunk * max(0.0, config.chunk_error)
+            / max(config.gp_error_fail, 1e-9)
+        )
+        progress = config.progress if math.isfinite(config.progress) else 0.0
+        c_progress = 1.0 / (
+            1.0 + math.exp(-config.gp_k_progress * (progress - config.gp_progress_midpoint))
+        )
+        w_sigma, w_chunk, w_progress = normalized_weights(
+            config.gp_w_sigma, config.gp_w_chunk, config.gp_w_progress
+        )
+        return g_skill * (
+            c_var ** w_sigma * c_chunk ** w_chunk * c_progress ** w_progress
+        ) ** max(config.gp_gamma, 0.0)
+
+    def prediction_weight_online(self, config):
+        """Compute the weighted-policy authority with online alpha filtering.
+
+        Args:
+            config: Fusion configuration for the current replay sample.
+
+        Returns:
+            Filtered prediction weight bounded by the configured min/max values.
+        """
+        c_net = self.compute_network_confidence(config)
+        c_gp = self.compute_gp_confidence(config) * config.confidence_gain
+        requested = c_gp / (c_net + c_gp + max(config.authority_eps, 1e-12))
+        self._filtered_prediction_weight = clamp(
+            self._filtered_prediction_weight + 0.1 * (
+                requested - self._filtered_prediction_weight
+            ),
+            config.min_prediction_weight,
+            config.max_prediction_weight,
+        )
+        return self._filtered_prediction_weight
+
+    @staticmethod
+    def latest_leader_pose(leader, elapsed, timeout):
+        """Return the latest non-stale leader pose at a replay timestamp.
+
+        Args:
+            leader: Time-ordered leader ``TimedPose`` samples.
+            elapsed: Replay time in seconds.
+            timeout: Maximum permitted leader sample age in seconds.
+
+        Returns:
+            Latest leader pose, or ``None`` when it is unavailable or stale.
+        """
+        latest = None
+        latest_time = None
+        for sample in leader:
+            if sample.time > elapsed:
+                break
+            latest = sample.pose
+            latest_time = sample.time
+        if latest is None or elapsed - latest_time > timeout:
+            return None
+        return latest
+
+    def fuse_pose_online(self, predicted_pose, leader_pose, config):
+        """Fuse poses with the selected online-fuser policy.
+
+        Args:
+            predicted_pose: GP pose sampled at the current replay time.
+            leader_pose: Latest non-stale TDPA leader pose, if available.
+            config: Fusion configuration for the current replay sample.
+
+        Returns:
+            Tuple of the online-fuser-equivalent pose and its alpha diagnostic.
+        """
+        if config.fusion_policy == 'weighted_blending':
+            alpha = self.prediction_weight_online(config)
+            return blend_pose(predicted_pose, leader_pose, alpha), alpha
+
+        c_net = self.compute_network_confidence(config)
+        c_gp = self.compute_gp_confidence(config)
+        g_skill = 1.0 if c_gp > 0.0 else 0.0
+        if config.fusion_policy == 'optimal_blending':
+            conflict = pose_conflict(leader_pose, predicted_pose) if leader_pose else 0.0
+            fused_pose, result = optimal_blend_pose(
+                predicted_pose, leader_pose, c_net=c_net, c_gp=c_gp,
+                alpha_prev=self._previous_optimal_weight, d=conflict,
+                lambda_s=config.optimal_lambda_s, lambda_c=config.optimal_lambda_c,
+                g_skill=g_skill, confidence_gain=config.confidence_gain,
+                min_prediction_weight=config.min_prediction_weight,
+                max_prediction_weight=config.max_prediction_weight,
+                authority_eps=config.authority_eps,
+            )
+            self._previous_optimal_weight = result.alpha_g
+            return fused_pose, result.alpha_g
+
+        current_pose = self._last_fused_pose or leader_pose or predicted_pose
+        fused_pose, _ = nash_blend_pose(
+            current_pose, predicted_pose, leader_pose, c_net=c_net, c_gp=c_gp,
+            g_skill=g_skill, confidence_gain=config.confidence_gain,
+            human_effort=config.nash_human_effort, gp_effort=config.nash_gp_effort,
+            human_agreement=config.nash_human_agreement,
+            gp_agreement=config.nash_gp_agreement,
+            agreement_ratio=config.nash_agreement_ratio,
+            rotation_weight=config.nash_rotation_weight, eps=config.authority_eps,
+        )
+        # Nash has no scalar alpha result; record the same online confidence
+        # authority for the passivity-controller diagnostic.
+        return fused_pose, self.prediction_weight_online(config)
+
+    @staticmethod
+    def replay_times(duration, rate):
+        """Generate online-fuser timer ticks through a prediction duration.
+
+        Args:
+            duration: Prediction duration in seconds.
+            rate: Fuser timer frequency in hertz.
+
+        Returns:
+            Monotonic replay timestamps, including the exact final duration.
+        """
+        period = 1.0 / rate if rate > 0.0 else 0.005
+        times = [index * period for index in range(int(math.floor(duration / period)) + 1)]
+        if not times or duration - times[-1] > 1e-12:
+            times.append(duration)
+        return times
 
     def fuse_trial(
         self,
@@ -940,57 +1108,72 @@ class OfflineFusionTestNode(Node):
         metrics,
         leader_time_relative,
     ):
-        """Fuse one prediction CSV with one leader execution CSV.
+        """Replay one trial using the online fuser timer and policy logic.
+
+        The requested alpha is passed through the alpha-conditioning portion of
+        ``AutonomyPassivityController`` and saved as ``autonomy_level``. The
+        pose remains the unmodified online-fuser result: the C++ energy tank
+        acts downstream on wrenches, which are not present in a pose CSV.
 
         Args:
-            prediction_path: Path to ``prediction_success_*.csv``.
-            leader_path: Path to ``leader_execution_*.csv``.
-            output_path: Destination path for ``fused_success_*.csv``.
-            config: Base fusion configuration containing network parameters.
-            metrics: Reconstructed or fixed prediction confidence metrics.
-            leader_time_relative: If true, subtract the first leader timestamp so
-                fusion starts at elapsed time 0.0.
+            prediction_path: Path to the saved prediction trajectory CSV.
+            leader_path: Path to the saved leader execution trajectory CSV.
+            output_path: Destination path for the fused CSV.
+            config: Base fusion configuration.
+            metrics: Reconstructed prediction confidence metrics.
+            leader_time_relative: Whether to align leader time to its first
+                sample before replay.
 
         Returns:
-            Tuple containing the number of fused samples, minimum alpha, and
-            maximum alpha written for this trial.
+            Number of fused samples, alpha minimum/maximum, and autonomy-level
+            minimum/maximum, in that order.
         """
         prediction = read_trajectory(prediction_path)
         leader = read_trajectory(leader_path)
         prediction_poses = [sample.pose for sample in prediction]
         prediction_times = [sample.time for sample in prediction]
         leader_t0 = leader[0].time if leader_time_relative else 0.0
+        leader = [TimedPose(max(0.0, sample.time - leader_t0), sample.pose) for sample in leader]
 
-        leader_poses = [sample.pose for sample in leader]
-        leader_times = [max(0.0, sample.time - leader_t0) for sample in leader]
-
+        self._previous_optimal_weight = 0.0
+        self._last_fused_pose = None
+        autonomy_controller = AutonomyPassivityController(
+            config.autonomy_alpha_time_constant,
+            config.autonomy_alpha_rate_limit,
+        )
         fused = []
         alphas = []
-        for elapsed in prediction_times:
-            elapsed = max(0.0, elapsed)
+        autonomy_levels = []
+        previous_elapsed = 0.0
+        for elapsed in self.replay_times(max(0.0, prediction_times[-1]), config.rate):
             predicted_pose = sample_timed_pose(prediction_poses, prediction_times, elapsed)
-            leader_pose = sample_timed_pose(leader_poses, leader_times, elapsed)
+            if predicted_pose is None:
+                continue
+            leader_pose = self.latest_leader_pose(
+                leader, elapsed, max(0.0, config.leader_timeout_sec)
+            )
             point_variance = sample_timed_value(
-                metrics.point_variances,
-                prediction_times,
-                elapsed,
-                metrics.trajectory_variance,
+                metrics.point_variances, prediction_times, elapsed, metrics.trajectory_variance
             )
             sample_config = replace(
                 config,
-                prediction_confidence=metrics.prediction_confidence,
                 skill_confidence=metrics.skill_confidence,
                 point_variance=point_variance,
                 chunk_error=metrics.chunk_error,
                 progress=metrics.progress,
             )
-            alpha = prediction_weight(sample_config)
-            fused_pose = blend_pose(predicted_pose, leader_pose, alpha)
-            fused.append(TimedPose(elapsed, fused_pose, alpha))
+            fused_pose, alpha = self.fuse_pose_online(
+                predicted_pose, leader_pose, sample_config
+            )
+            autonomy_level = autonomy_controller.update_alpha(alpha, elapsed - previous_elapsed)
+            self._last_fused_pose = fused_pose
+            fused.append(TimedPose(elapsed, fused_pose, alpha, autonomy_level))
             alphas.append(alpha)
+            autonomy_levels.append(autonomy_level)
+            previous_elapsed = elapsed
 
         write_trajectory(output_path, fused)
-        return len(fused), min(alphas), max(alphas)
+        return len(fused), min(alphas), max(alphas), min(autonomy_levels), max(autonomy_levels)
 
 
 def main(args=None):

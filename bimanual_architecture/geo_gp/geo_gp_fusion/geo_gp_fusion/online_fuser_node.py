@@ -77,6 +77,7 @@ class OnlineFuserNode(Node):
         self.tdpa_pose_topic = self.get_parameter('tdpa_pose_topic').value
         self.network_state_topic = self.get_parameter('network_state_topic').value
         self.output_pose_topic = self.get_parameter('output_pose_topic').value
+        self.online_fuser_active_topic = "/execution/online_fuser_active"
         self.running_topic = self.get_parameter('running_topic').value
         self.rate = float(self.get_parameter('rate').value)
         self.leader_timeout_sec = float(self.get_parameter('leader_timeout_sec').value)
@@ -174,11 +175,17 @@ class OnlineFuserNode(Node):
             10,
         )
         self.running_pub = self.create_publisher(Bool, self.running_topic, running_qos)
+        self.online_fuser_active_pub = self.create_publisher(
+            Bool, self.online_fuser_active_topic, running_qos
+        )
 
         period = 1.0 / self.rate if self.rate > 0.0 else 0.005
         self.timer = self.create_timer(period, self.timer_callback)
 
         self.publish_running(False)
+        active_msg = Bool()
+        active_msg.data = True
+        self.online_fuser_active_pub.publish(active_msg)
         self.get_logger().info(
             'Online fuser started | '
             f'prediction={self.prediction_topic} | tdpa_pose={self.tdpa_pose_topic} | '
@@ -612,7 +619,14 @@ class OnlineFuserNode(Node):
         c_net = self.compute_network_confidence(network_delay, network_jitter)
         c_gp = self.compute_gp_confidence(pred, point_variance) * self.confidence_gain
         weight = c_gp / (c_net + c_gp + max(self.authority_eps, 1e-12))
-        return clamp(weight, self.min_prediction_weight, self.max_prediction_weight)
+        # Conservative first-order alpha low-pass. The fuser runs at a fixed rate;
+        # start at zero so a new prediction cannot introduce an authority step.
+        previous = getattr(self, "_filtered_prediction_weight", 0.0)
+        self._filtered_prediction_weight = clamp(
+            previous + 0.1 * (weight - previous),
+            self.min_prediction_weight, self.max_prediction_weight,
+        )
+        return self._filtered_prediction_weight
 
     def publish_pose(self, pose):
         """
