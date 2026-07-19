@@ -11,6 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
+    extras_require={'mujoco': ['mujoco>=3.2']},
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='user',

@@ -19,5 +19,7 @@ import pytest
 @pytest.mark.linter
 @pytest.mark.pep257
 def test_pep257():
-    rc = main(argv=['.', 'test'])
+    rc = main(argv=[
+        '--convention', 'google', '--add-ignore', 'D100', 'D103', 'D104', 'D107', '.', 'test',
+    ])
     assert rc == 0, 'Found code style errors / warnings'

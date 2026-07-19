@@ -1,23 +1,22 @@
 """Offline CSV-based test node for Geo-GP trajectory fusion."""
 
 import csv
+from dataclasses import dataclass, replace
 import json
 import math
-from dataclasses import dataclass, replace
 from pathlib import Path
 
-import numpy as np
-import rclpy
-from geometry_msgs.msg import Pose, Vector3
-from rclpy.node import Node
-
+from geo_gp_fusion.policies.nash_blending import nash_blend_pose
+from geo_gp_fusion.policies.optimal_blending import optimal_blend_pose, pose_conflict
+from geo_gp_fusion.policies.weighted_blending import blend_pose, sample_timed_pose
 from geo_gp_interfaces.msg import PromptTrajectory
 from geo_gp_prediction.predictor import Predictor
 from geometry.frame6d import estimate_rotation_scale_3d_search_by_count
 from geometry.resample import resample_by_arclen_fraction
-from geo_gp_fusion.policies.weighted_blending import blend_pose, sample_timed_pose
-from geo_gp_fusion.policies.optimal_blending import optimal_blend_pose, pose_conflict
-from geo_gp_fusion.policies.nash_blending import nash_blend_pose
+from geometry_msgs.msg import Pose, Vector3
+import numpy as np
+import rclpy
+from rclpy.node import Node
 
 
 POSE_FIELDS = ('time', 'x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')
@@ -36,7 +35,10 @@ class TimedPose:
     time: float
     pose: Pose
     alpha: float = None
-    autonomy_level: float = None
+    tank_energy: float = None
+    passivity_lambda: float = None
+    passivity_power: float = None
+    autonomy_wrench_norm: float = None
 
 
 @dataclass
@@ -103,6 +105,8 @@ class FusionConfig:
     rate: float
     leader_timeout_sec: float
     fusion_policy: str
+    tdpa_enabled: bool
+    tdpa_delay_sec: float
     optimal_lambda_s: float
     optimal_lambda_c: float
     nash_human_effort: float
@@ -111,53 +115,751 @@ class FusionConfig:
     nash_gp_agreement: float
     nash_agreement_ratio: float
     nash_rotation_weight: float
-    autonomy_alpha_time_constant: float
-    autonomy_alpha_rate_limit: float
+
+    simulate_mujoco: bool
+    mujoco_model_path: str
+    mujoco_site_name: str
+    mujoco_timestep: float
+    mujoco_settle_time_sec: float
+    mujoco_initialize_from_leader: bool
+    mujoco_pos_stiffness: float
+    mujoco_rot_stiffness: float
+    mujoco_nullspace_stiffness: float
+    mujoco_torque_rate_limit: float
+    autonomy_tank_initial_energy: float
+    autonomy_tank_max_energy: float
+    autonomy_tank_recharge_efficiency: float
+    autonomy_tank_power_epsilon: float
+    autonomy_tank_velocity_epsilon: float
+    autonomy_wrench_max_abs: float
+
+
+class EnergyTank:
+    """Numerically identical offline implementation of the C++ energy tank.
+
+    Args:
+        initial_energy: Initial stored energy in joules.
+        max_energy: Upper bound on stored energy in joules.
+        recharge_efficiency: Fraction of absorbed energy stored by the tank.
+        power_epsilon: Numerical threshold for power classification.
+        velocity_epsilon: Minimum Cartesian speed used to calculate power.
+        wrench_max_abs: Per-axis absolute wrench limit.
+    """
+
+    def __init__(self, initial_energy, max_energy, recharge_efficiency,
+                 power_epsilon, velocity_epsilon, wrench_max_abs):
+        """Initialize the tank with bounded energy and safety parameters.
+
+        Args:
+            initial_energy: Initial stored energy in joules.
+            max_energy: Upper bound on stored energy in joules.
+            recharge_efficiency: Fraction of absorbed energy stored by the tank.
+            power_epsilon: Numerical threshold for power classification.
+            velocity_epsilon: Minimum Cartesian speed used to calculate power.
+            wrench_max_abs: Per-axis absolute wrench limit.
+        """
+        self.initial_energy = float(initial_energy)
+        self.max_energy = max(0.0, float(max_energy))
+        self.recharge_efficiency = clamp(float(recharge_efficiency), 0.0, 1.0)
+        self.power_epsilon = max(0.0, float(power_epsilon))
+        self.velocity_epsilon = max(0.0, float(velocity_epsilon))
+        self.wrench_max_abs = max(0.0, float(wrench_max_abs))
+        self.energy = clamp(self.initial_energy, 0.0, self.max_energy)
+
+    def update(self, wrench_autonomy, velocity, dt):
+        """Scale an autonomy wrench according to available tank energy.
+
+        Args:
+            wrench_autonomy: Six-dimensional autonomy wrench.
+            velocity: Actual six-dimensional end-effector velocity.
+            dt: Physics time step in seconds.
+
+        Returns:
+            Tuple of safe wrench, wrench scale, and pre-scaling power.
+        """
+        wrench = np.clip(np.nan_to_num(wrench_autonomy),
+                         -self.wrench_max_abs, self.wrench_max_abs)
+        valid_velocity = bool(np.all(np.isfinite(velocity)))
+        speed = float(np.linalg.norm(velocity)) if valid_velocity else 0.0
+        power = float(np.dot(wrench, velocity)) if (
+            dt > 0.0 and valid_velocity and speed > self.velocity_epsilon
+        ) else 0.0
+        scale = 1.0
+        if power > self.power_epsilon and dt > 0.0:
+            demand = power * dt
+            scale = clamp(self.energy / (demand + self.power_epsilon), 0.0, 1.0)
+            wrench *= scale
+            self.energy -= scale * demand
+        elif power < -self.power_epsilon and dt > 0.0:
+            self.energy += self.recharge_efficiency * (-power) * dt
+        self.energy = clamp(float(np.nan_to_num(self.energy)), 0.0, self.max_energy)
+        return wrench, scale, power
+
+
+@dataclass
+class AutonomyPassivityOutput:
+    """Offline counterpart of the C++ ``AutonomyPassivityOutput``.
+
+    Attributes:
+        wrench_autonomy_safe: Passivity-limited autonomy wrench.
+        lambda_value: Applied autonomy-wrench scale.
+        power: Autonomy-wrench power before scaling.
+        tank_energy: Remaining energy after the update.
+    """
+
+    wrench_autonomy_safe: np.ndarray
+    lambda_value: float
+    power: float
+    tank_energy: float
 
 
 class AutonomyPassivityController:
-    """Pose-only equivalent of the controller-side autonomy alpha conditioner.
-
-    The C++ energy tank constrains Cartesian wrenches, which cannot be
-    reconstructed from pose-only CSV files. Its alpha conditioner is reproduced
-    here so the saved autonomy level matches the requested controller behavior.
+    """Apply the same autonomy-wrench separation as the C++ controller.
 
     Args:
-        alpha_time_constant: Time constant in seconds for alpha smoothing.
-        alpha_rate_limit: Maximum alpha change per second. Non-positive values
-            disable rate limiting.
+        tank: Energy tank used to limit the autonomy component.
     """
 
-    def __init__(self, alpha_time_constant=0.05, alpha_rate_limit=2.0):
-        self.alpha_time_constant = float(alpha_time_constant)
-        self.alpha_rate_limit = float(alpha_rate_limit)
-        self.alpha = 0.0
-
-    def update_alpha(self, alpha_requested, dt):
-        """Filter and rate-limit a requested autonomy level.
+    def __init__(self, tank):
+        """Initialize the controller with its autonomy energy tank.
 
         Args:
-            alpha_requested: Raw requested autonomy in the range ``[0, 1]``.
-            dt: Time step in seconds since the previous update.
+            tank: Energy tank used to limit the autonomy component.
+        """
+        self.tank = tank
+
+    def update(self, wrench_leader, wrench_total, velocity, dt):
+        """Limit only the wrench introduced by the fused autonomous target.
+
+        Args:
+            wrench_leader: Wrench generated by the leader-only target.
+            wrench_total: Wrench generated by the fused target.
+            velocity: Actual six-dimensional end-effector velocity.
+            dt: Physics time step in seconds.
 
         Returns:
-            Passivity-controller-conditioned autonomy level in ``[0, 1]``.
+            AutonomyPassivityOutput containing the safe autonomy wrench and
+            matching energy-tank diagnostics.
         """
-        requested = clamp(
-            float(alpha_requested) if math.isfinite(float(alpha_requested)) else 0.0,
+        safe, lambda_value, power = self.tank.update(wrench_total - wrench_leader, velocity, dt)
+        return AutonomyPassivityOutput(safe, lambda_value, power, self.tank.energy)
+
+
+def pose_rotation(pose):
+    """Convert a ROS pose orientation to a rotation matrix.
+
+    Args:
+        pose: ROS pose with an xyzw quaternion orientation.
+
+    Returns:
+        Three-by-three world-frame rotation matrix.
+    """
+    x, y, z, w = (pose.orientation.x, pose.orientation.y,
+                  pose.orientation.z, pose.orientation.w)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm < 1e-12:
+        return np.eye(3)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return np.array(((1 - 2 * (y*y + z*z), 2 * (x*y-z*w), 2 * (x*z+y*w)),
+                     (2 * (x*y+z*w), 1 - 2 * (x*x+z*z), 2 * (y*z-x*w)),
+                     (2 * (x*z-y*w), 2 * (y*z+x*w), 1 - 2 * (x*x+y*y))))
+
+
+def quaternion_from_rotation(rotation):
+    """Convert a three-by-three rotation matrix to an xyzw quaternion.
+
+    Args:
+        rotation: Three-by-three world-frame rotation matrix.
+
+    Returns:
+        Tuple of four quaternion components in xyzw order.
+    """
+    matrix = np.asarray(rotation, dtype=np.float64)
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = 2.0 * math.sqrt(trace + 1.0)
+        quaternion = np.array((
+            (matrix[2, 1] - matrix[1, 2]) / scale,
+            (matrix[0, 2] - matrix[2, 0]) / scale,
+            (matrix[1, 0] - matrix[0, 1]) / scale,
+            0.25 * scale,
+        ))
+    else:
+        index = int(np.argmax(np.diag(matrix)))
+        next_index, last_index = (index + 1) % 3, (index + 2) % 3
+        scale = 2.0 * math.sqrt(max(
             0.0,
-            1.0,
+            1.0 + matrix[index, index] - matrix[next_index, next_index]
+            - matrix[last_index, last_index],
+        ))
+        if scale < 1e-12:
+            return (0.0, 0.0, 0.0, 1.0)
+        quaternion = np.zeros(4)
+        quaternion[index] = 0.25 * scale
+        quaternion[next_index] = (
+            matrix[next_index, index] + matrix[index, next_index]
+        ) / scale
+        quaternion[last_index] = (
+            matrix[last_index, index] + matrix[index, last_index]
+        ) / scale
+        quaternion[3] = (
+            matrix[last_index, next_index] - matrix[next_index, last_index]
+        ) / scale
+    norm = float(np.linalg.norm(quaternion))
+    if norm < 1e-12 or not math.isfinite(norm):
+        return (0.0, 0.0, 0.0, 1.0)
+    return tuple(quaternion / norm)
+
+
+def rotation_error(current, desired):
+    """Compute the world-frame rotation-vector error.
+
+    Args:
+        current: Current three-by-three rotation matrix.
+        desired: Desired three-by-three rotation matrix.
+
+    Returns:
+        Three-dimensional world-frame rotation error.
+    """
+    relative = desired @ current.T
+    angle = math.acos(clamp((float(np.trace(relative)) - 1.0) * 0.5, -1.0, 1.0))
+    axis = np.array((relative[2, 1] - relative[1, 2],
+                     relative[0, 2] - relative[2, 0],
+                     relative[1, 0] - relative[0, 1]))
+    axis_norm = float(np.linalg.norm(axis))
+    return np.zeros(3) if angle < 1e-9 or axis_norm < 1e-9 else axis * angle / axis_norm
+
+
+@dataclass
+class TDPACartesianState:
+    """Store one delayed Cartesian TDPA message.
+
+    Attributes:
+        velocity: Six-dimensional Cartesian velocity from the leader side.
+        wrench: Six-dimensional Cartesian wrench from the follower side.
+        energy_linear: Accumulated linear-channel TDPA energy.
+        energy_rotational: Accumulated rotational-channel TDPA energy.
+    """
+
+    velocity: np.ndarray
+    wrench: np.ndarray
+    energy_linear: float
+    energy_rotational: float
+
+
+class CartesianTDPAPort:
+    """Represent one three-axis Cartesian TDPA energy port.
+
+    Attributes:
+        energy_in: Energy received through the local port.
+        energy_out: Energy delivered through the local port.
+        energy_delayed: Most recently received remote energy value.
+        energy_dissipated: Energy dissipated by the TDPA correction.
+    """
+
+    def __init__(self):
+        """Initialize empty local, remote, and dissipated energy counters."""
+        self.energy_in = 0.0
+        self.energy_out = 0.0
+        self.energy_delayed = 0.0
+        self.energy_dissipated = 0.0
+
+    def observe(self, velocity, wrench, dt):
+        """Update local TDPA energy flows from a power sample.
+
+        Args:
+            velocity: Three-dimensional Cartesian velocity at this port.
+            wrench: Three-dimensional Cartesian wrench at this port.
+            dt: Integration time step in seconds.
+        """
+        if dt <= 0.0 or not np.all(np.isfinite(velocity)):
+            return
+        power = float(np.dot(velocity, wrench))
+        if not math.isfinite(power):
+            return
+        self.energy_in += max(0.0, power) * dt
+        self.energy_out += max(0.0, -power) * dt
+
+    def limit_force(self, wrench, velocity, remote_energy, dt):
+        """Apply the leader-side TDPA force correction.
+
+        Args:
+            wrench: Three-dimensional force before the TDPA correction.
+            velocity: Three-dimensional local leader velocity.
+            remote_energy: Delayed energy reported by the follower port.
+            dt: Integration time step in seconds.
+
+        Returns:
+            Passivity-corrected three-dimensional leader force.
+        """
+        if dt <= 0.0:
+            return wrench
+        self.energy_delayed = float(remote_energy)
+        shortage = self.energy_delayed - self.energy_out + self.energy_dissipated
+        velocity_norm_sq = float(np.dot(velocity, velocity))
+        if shortage >= 0.0 or velocity_norm_sq <= 1e-6:
+            return wrench
+        alpha = -shortage / (dt * velocity_norm_sq)
+        correction = alpha * velocity
+        self.energy_dissipated += dt * float(np.dot(velocity, correction))
+        return wrench + correction
+
+    def limit_velocity(self, velocity, wrench, remote_energy, dt):
+        """Apply the follower-side TDPA velocity correction.
+
+        Args:
+            velocity: Three-dimensional velocity before the TDPA correction.
+            wrench: Three-dimensional local follower wrench.
+            remote_energy: Delayed energy reported by the leader port.
+            dt: Integration time step in seconds.
+
+        Returns:
+            Passivity-corrected three-dimensional follower velocity.
+        """
+        if dt <= 0.0:
+            return velocity
+        self.energy_delayed = float(remote_energy)
+        shortage = self.energy_delayed - self.energy_out + self.energy_dissipated
+        wrench_norm_sq = float(np.dot(wrench, wrench))
+        if shortage >= 0.0 or wrench_norm_sq <= 1e-6:
+            return velocity
+        beta = -shortage / (dt * wrench_norm_sq)
+        correction = beta * wrench
+        self.energy_dissipated += dt * float(np.dot(wrench, correction))
+        return velocity + correction
+
+
+def integrate_rotation_world(rotation, angular_velocity, dt):
+    """Integrate world-frame angular velocity over one TDPA step.
+
+    Args:
+        rotation: Current three-by-three world-frame rotation matrix.
+        angular_velocity: Three-dimensional world-frame angular velocity.
+        dt: Integration time step in seconds.
+
+    Returns:
+        Updated three-by-three world-frame rotation matrix.
+    """
+    angle = float(np.linalg.norm(angular_velocity)) * dt
+    if angle <= 1e-12:
+        return rotation
+    axis = angular_velocity / float(np.linalg.norm(angular_velocity))
+    skew = np.array((
+        (0.0, -axis[2], axis[1]),
+        (axis[2], 0.0, -axis[0]),
+        (-axis[1], axis[0], 0.0),
+    ))
+    delta = np.eye(3) + math.sin(angle) * skew + (1.0 - math.cos(angle)) * skew @ skew
+    return delta @ rotation
+
+
+class OfflineCartesianTDPA:
+    """Replay the leader/follower Cartesian TDPA state exchange.
+
+    The implementation mirrors the two split three-axis TDPA ports used by the
+    controller. Messages carry leader velocity, follower wrench feedback, and
+    their accumulated energy; both directions share the configured one-way
+    delay.
+    """
+
+    def __init__(self, initial_pose, delay_sec):
+        """Initialize a delayed Cartesian TDPA replay.
+
+        Args:
+            initial_pose: Initial Cartesian reference pose for the follower.
+            delay_sec: One-way communication delay in seconds.
+        """
+        self.reference_position = np.array((
+            initial_pose.position.x,
+            initial_pose.position.y,
+            initial_pose.position.z,
+        ))
+        self.reference_rotation = pose_rotation(initial_pose)
+        self.delay_sec = max(0.0, float(delay_sec))
+        self.leader_linear = CartesianTDPAPort()
+        self.leader_rotational = CartesianTDPAPort()
+        self.follower_linear = CartesianTDPAPort()
+        self.follower_rotational = CartesianTDPAPort()
+        self.latest_leader = TDPACartesianState(
+            np.zeros(6), np.zeros(6), 0.0, 0.0
         )
-        safe_dt = float(dt) if math.isfinite(float(dt)) and dt > 0.0 else 0.0
-        target = requested
-        if self.alpha_time_constant > 0.0 and safe_dt > 0.0:
-            beta = safe_dt / (self.alpha_time_constant + safe_dt)
-            target = self.alpha + beta * (requested - self.alpha)
-        if self.alpha_rate_limit > 0.0 and safe_dt > 0.0:
-            delta = self.alpha_rate_limit * safe_dt
-            target = clamp(target, self.alpha - delta, self.alpha + delta)
-        self.alpha = clamp(target, 0.0, 1.0)
-        return self.alpha
+        self.latest_follower = TDPACartesianState(
+            np.zeros(6), np.zeros(6), 0.0, 0.0
+        )
+        self.leader_queue = []
+        self.follower_queue = []
+
+    @staticmethod
+    def _deliver(queue, elapsed, current):
+        """Deliver all TDPA messages whose arrival time has elapsed.
+
+        Args:
+            queue: Time-ordered queue of arrival-time/state pairs.
+            elapsed: Current replay time in seconds.
+            current: Most recently delivered TDPA state.
+
+        Returns:
+            Latest TDPA state available at ``elapsed``.
+        """
+        while queue and queue[0][0] <= elapsed + 1e-12:
+            _, current = queue.pop(0)
+        return current
+
+    def pose(self):
+        """Return the TDPA-integrated follower Cartesian reference.
+
+        Returns:
+            Current follower target pose after velocity integration.
+        """
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = self.reference_position
+        (pose.orientation.x, pose.orientation.y, pose.orientation.z,
+         pose.orientation.w) = quaternion_from_rotation(self.reference_rotation)
+        return pose
+
+    def step(self, elapsed, leader_velocity, follower_wrench, dt):
+        """Exchange delayed TDPA states and advance the follower reference.
+
+        Args:
+            elapsed: Current replay time in seconds.
+            leader_velocity: Current six-dimensional raw leader velocity.
+            follower_wrench: Current six-dimensional follower control wrench.
+            dt: Replay integration time step in seconds.
+
+        Returns:
+            TDPA-integrated follower target pose.
+        """
+        self.latest_leader = self._deliver(
+            self.leader_queue, elapsed, self.latest_leader
+        )
+        self.latest_follower = self._deliver(
+            self.follower_queue, elapsed, self.latest_follower
+        )
+        leader_velocity = np.nan_to_num(np.asarray(leader_velocity, dtype=np.float64))
+        follower_wrench = np.nan_to_num(np.asarray(follower_wrench, dtype=np.float64))
+
+        leader_wrench = self.latest_follower.wrench.copy()
+        self.leader_linear.observe(
+            leader_velocity[:3], leader_wrench[:3], dt
+        )
+        self.leader_rotational.observe(
+            leader_velocity[3:], leader_wrench[3:], dt
+        )
+        leader_wrench[:3] = self.leader_linear.limit_force(
+            leader_wrench[:3],
+            leader_velocity[:3],
+            self.latest_follower.energy_linear,
+            dt,
+        )
+        leader_wrench[3:] = self.leader_rotational.limit_force(
+            leader_wrench[3:],
+            leader_velocity[3:],
+            self.latest_follower.energy_rotational,
+            dt,
+        )
+        leader_state = TDPACartesianState(
+            leader_velocity,
+            leader_wrench,
+            self.leader_linear.energy_in,
+            self.leader_rotational.energy_in,
+        )
+        self.leader_queue.append((elapsed + self.delay_sec, leader_state))
+
+        desired_velocity = self.latest_leader.velocity.copy()
+        self.follower_linear.observe(
+            desired_velocity[:3], follower_wrench[:3], dt
+        )
+        self.follower_rotational.observe(
+            desired_velocity[3:], follower_wrench[3:], dt
+        )
+        desired_velocity[:3] = self.follower_linear.limit_velocity(
+            desired_velocity[:3],
+            follower_wrench[:3],
+            self.latest_leader.energy_linear,
+            dt,
+        )
+        desired_velocity[3:] = self.follower_rotational.limit_velocity(
+            desired_velocity[3:],
+            follower_wrench[3:],
+            self.latest_leader.energy_rotational,
+            dt,
+        )
+        self.reference_position += dt * desired_velocity[:3]
+        self.reference_rotation = integrate_rotation_world(
+            self.reference_rotation,
+            desired_velocity[3:],
+            dt,
+        )
+        follower_state = TDPACartesianState(
+            desired_velocity,
+            follower_wrench,
+            self.follower_linear.energy_in,
+            self.follower_rotational.energy_in,
+        )
+        self.follower_queue.append((elapsed + self.delay_sec, follower_state))
+        return self.pose()
+
+
+class MujocoAutonomyPassivitySimulator:
+    """Replay Panda dynamics and supply physical state to the passivity controller.
+
+    Args:
+        model_path: MuJoCo XML model path.
+        site_name: End-effector site name.
+        timestep: MuJoCo physics time step in seconds.
+        initial_q: Initial positions of Panda joints one through seven.
+        config: Offline fusion and passivity configuration.
+        initial_pose: Optional leader pose used to initialize the end effector.
+    """
+
+    def __init__(
+        self,
+        model_path,
+        site_name,
+        timestep,
+        initial_q,
+        config,
+        initial_pose=None,
+    ):
+        """Load the MuJoCo model and initialize the torque-controlled Panda.
+
+        Args:
+            model_path: MuJoCo XML model path.
+            site_name: End-effector site name.
+            timestep: MuJoCo physics time step in seconds.
+            initial_q: Initial positions of Panda joints one through seven.
+            config: Offline fusion and passivity configuration.
+            initial_pose: Optional leader pose used for Cartesian IK initialization.
+
+        Raises:
+            FileNotFoundError: If the MuJoCo model path does not exist.
+            RuntimeError: If the Python MuJoCo package is unavailable.
+            ValueError: If the model does not expose the required Panda elements.
+        """
+        try:
+            import mujoco
+        except ImportError as exc:
+            raise RuntimeError(
+                'simulate_mujoco=true requires Python MuJoCo (pip install mujoco>=3.2).'
+            ) from exc
+        self.mujoco = mujoco
+        path = expand_path(model_path)
+        if not path.is_file():
+            raise FileNotFoundError(f'MuJoCo model does not exist: {path}')
+        self.model = mujoco.MjModel.from_xml_path(str(path))
+        self.data = mujoco.MjData(self.model)
+        self.site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+        if self.site_id < 0:
+            raise ValueError(f'MuJoCo site {site_name!r} does not exist')
+        if len(initial_q) != 7:
+            raise ValueError('mujoco_initial_joint_positions must have seven values')
+        self.joints, self.qpos, self.dof, self.actuators = [], [], [], []
+        for index in range(1, 8):
+            joint = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, f'panda_joint{index}')
+            actuator = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f'panda_act_trq{index}')
+            if joint < 0 or actuator < 0:
+                raise ValueError('Model must contain panda_joint1..7 and panda_act_trq1..7')
+            self.joints.append(joint)
+            self.qpos.append(int(self.model.jnt_qposadr[joint]))
+            self.dof.append(int(self.model.jnt_dofadr[joint]))
+            self.actuators.append(actuator)
+        # scene.xml also defines position/velocity/gripper actuators. They
+        # would apply forces at their default zero controls and do not exist in
+        # the torque-only Cartesian controller, so disable them for this replay.
+        torque_actuators = set(self.actuators)
+        for actuator in range(self.model.nu):
+            if actuator not in torque_actuators:
+                self.model.actuator_gainprm[actuator, :] = 0.0
+                self.model.actuator_biasprm[actuator, :] = 0.0
+        self.data.qpos[self.qpos] = np.asarray(initial_q, dtype=np.float64)
+        self.model.opt.timestep = max(float(timestep), 1e-5)
+        self.stiffness = np.array([config.mujoco_pos_stiffness] * 3 +
+                                  [config.mujoco_rot_stiffness] * 3)
+        self.damping = np.array([2.0 * math.sqrt(config.mujoco_pos_stiffness)] * 3 +
+                                [1.6 * math.sqrt(config.mujoco_rot_stiffness)] * 3)
+        self.autonomy_pc = AutonomyPassivityController(EnergyTank(
+            config.autonomy_tank_initial_energy, config.autonomy_tank_max_energy,
+            config.autonomy_tank_recharge_efficiency, config.autonomy_tank_power_epsilon,
+            config.autonomy_tank_velocity_epsilon, config.autonomy_wrench_max_abs,
+        ))
+        self.nullspace_stiffness = max(0.0, config.mujoco_nullspace_stiffness)
+        self.torque_rate_limit = max(0.0, config.mujoco_torque_rate_limit)
+        self.desired_nullspace_q = np.asarray(initial_q, dtype=np.float64).copy()
+        self.previous_torque = None
+        self.last_command_wrench = np.zeros(6)
+        mujoco.mj_forward(self.model, self.data)
+        self.initialization_error = None
+        if initial_pose is not None:
+            self.initialization_error = self.initialize_to_pose(initial_pose)
+        self.desired_nullspace_q = self.data.qpos[self.qpos].copy()
+
+    def current_pose(self):
+        """Return the current simulated end-effector pose.
+
+        Returns:
+            Pose of the MuJoCo end-effector site.
+        """
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = self.data.site_xpos[self.site_id]
+        quaternion = quaternion_from_rotation(
+            self.data.site_xmat[self.site_id].reshape(3, 3)
+        )
+        (pose.orientation.x, pose.orientation.y, pose.orientation.z,
+         pose.orientation.w) = quaternion
+        return pose
+
+    def initialize_to_pose(self, target_pose):
+        """Use damped least-squares IK to align the Panda with a target pose.
+
+        The saved leader CSV contains Cartesian poses rather than joint
+        positions. The configured joint positions are therefore only used as
+        an IK seed; this method makes the simulated end effector start at the
+        first leader pose.
+
+        Args:
+            target_pose: Leader pose used as the desired initial end-effector
+                pose.
+
+        Returns:
+            Tuple of final position error, final rotation error, and convergence
+            flag.
+        """
+        target_position = np.array((
+            target_pose.position.x,
+            target_pose.position.y,
+            target_pose.position.z,
+        ))
+        target_rotation = pose_rotation(target_pose)
+        position_tolerance = 1e-4
+        rotation_tolerance = 1e-3
+        for _ in range(250):
+            self.mujoco.mj_forward(self.model, self.data)
+            position = self.data.site_xpos[self.site_id]
+            rotation = self.data.site_xmat[self.site_id].reshape(3, 3)
+            position_error = target_position - position
+            orientation_error = rotation_error(rotation, target_rotation)
+            if (
+                float(np.linalg.norm(position_error)) <= position_tolerance
+                and float(np.linalg.norm(orientation_error)) <= rotation_tolerance
+            ):
+                break
+            jacobian_position = np.zeros((3, self.model.nv))
+            jacobian_rotation = np.zeros((3, self.model.nv))
+            self.mujoco.mj_jacSite(
+                self.model,
+                self.data,
+                jacobian_position,
+                jacobian_rotation,
+                self.site_id,
+            )
+            jacobian = np.vstack((
+                jacobian_position[:, self.dof],
+                jacobian_rotation[:, self.dof],
+            ))
+            error = np.r_[position_error, orientation_error]
+            damping = 1e-3
+            joint_delta = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + damping * np.eye(6),
+                error,
+            )
+            joint_delta = np.clip(joint_delta, -0.1, 0.1)
+            for joint, qpos, delta in zip(self.joints, self.qpos, joint_delta):
+                low, high = self.model.jnt_range[joint]
+                self.data.qpos[qpos] = clamp(
+                    float(self.data.qpos[qpos] + delta),
+                    float(low),
+                    float(high),
+                )
+        self.data.qvel[self.dof] = 0.0
+        self.mujoco.mj_forward(self.model, self.data)
+        position_error = float(np.linalg.norm(
+            target_position - self.data.site_xpos[self.site_id]
+        ))
+        orientation_error = float(np.linalg.norm(rotation_error(
+            self.data.site_xmat[self.site_id].reshape(3, 3),
+            target_rotation,
+        )))
+        return (
+            position_error,
+            orientation_error,
+            position_error <= position_tolerance
+            and orientation_error <= rotation_tolerance,
+        )
+
+    def advance(self, leader_pose, fused_pose, duration):
+        """Advance simulation while applying passivity-limited Cartesian wrench.
+
+        Args:
+            leader_pose: Leader-only Cartesian target pose.
+            fused_pose: Fused Cartesian target pose.
+            duration: Time to advance in seconds.
+
+        Returns:
+            Tuple of actual end-effector pose, tank energy, lambda, power, and
+            safe autonomy-wrench norm from the final physics step.
+        """
+        leader_p = np.array((
+            leader_pose.position.x, leader_pose.position.y, leader_pose.position.z,
+        ))
+        fused_p = np.array((
+            fused_pose.position.x, fused_pose.position.y, fused_pose.position.z,
+        ))
+        leader_r, fused_r = pose_rotation(leader_pose), pose_rotation(fused_pose)
+        remaining = max(0.0, float(duration))
+        result = (self.autonomy_pc.tank.energy, 1.0, 0.0, 0.0)
+        while remaining > 1e-12:
+            dt = min(remaining, self.model.opt.timestep)
+            jacp, jacr = np.zeros((3, self.model.nv)), np.zeros((3, self.model.nv))
+            self.mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.site_id)
+            velocity = np.r_[jacp @ self.data.qvel, jacr @ self.data.qvel]
+            position = self.data.site_xpos[self.site_id]
+            rotation = self.data.site_xmat[self.site_id].reshape(3, 3)
+            leader_error = np.r_[leader_p - position, rotation_error(rotation, leader_r)]
+            total_error = np.r_[fused_p - position, rotation_error(rotation, fused_r)]
+            f_leader = self.stiffness * leader_error - self.damping * velocity
+            f_total = self.stiffness * total_error - self.damping * velocity
+            passivity = self.autonomy_pc.update(f_leader, f_total, velocity, dt)
+            safe = passivity.wrench_autonomy_safe
+            self.last_command_wrench = f_leader + safe
+            jacobian = np.vstack((jacp[:, self.dof], jacr[:, self.dof]))
+            joint_position = self.data.qpos[self.qpos]
+            joint_velocity = self.data.qvel[self.dof]
+            nullspace_command = (
+                self.nullspace_stiffness * (self.desired_nullspace_q - joint_position)
+                - 2.0 * math.sqrt(self.nullspace_stiffness) * joint_velocity
+            )
+            projector = np.eye(len(self.dof)) - jacobian.T @ np.linalg.pinv(jacobian.T)
+            nullspace_torque = projector @ nullspace_command
+            # The scene applies gravity through gravcomp=1. qfrc_bias includes
+            # that same term, so remove qfrc_gravcomp to avoid double compensation.
+            requested_torque = (
+                jacobian.T @ (f_leader + safe)
+                + self.data.qfrc_bias[self.dof]
+                - self.data.qfrc_gravcomp[self.dof]
+                + nullspace_torque
+            )
+            if self.previous_torque is None or self.torque_rate_limit <= 0.0:
+                torque = requested_torque
+            else:
+                max_delta = self.torque_rate_limit * dt
+                torque = np.clip(
+                    requested_torque,
+                    self.previous_torque - max_delta,
+                    self.previous_torque + max_delta,
+                )
+            applied_torque = np.empty(len(self.actuators))
+            for index, (actuator, value) in enumerate(zip(self.actuators, torque)):
+                lo, hi = self.model.actuator_ctrlrange[actuator]
+                applied_torque[index] = clamp(float(value), float(lo), float(hi))
+                self.data.ctrl[actuator] = applied_torque[index]
+            self.previous_torque = applied_torque
+            self.mujoco.mj_step(self.model, self.data)
+            remaining -= dt
+            result = (passivity.tank_energy, passivity.lambda_value, passivity.power,
+                      float(np.linalg.norm(safe)))
+        return self.current_pose(), *result
 
 
 @dataclass
@@ -306,9 +1008,43 @@ def read_trajectory(csv_path):
             raise ValueError(f'{csv_path} is missing columns: {missing}')
         for row in reader:
             samples.append(pose_from_row(row))
+
     if not samples:
         raise ValueError(f'{csv_path} contains no trajectory samples')
+
     return samples
+
+
+def sample_timed_value(values, times, elapsed, default=0.0):
+    """Sample the nearest value from a time-indexed sequence.
+
+    Args:
+        values: Values corresponding to ``times``.
+        times: Sample timestamps in seconds.
+        elapsed: Replay time in seconds.
+        default: Value returned when the sequence cannot be sampled.
+
+    Returns:
+        The nearest time-aligned value, or ``default`` when unavailable.
+    """
+    if not values:
+        return default
+    if len(values) == 1 or not times:
+        return values[0]
+    count = min(len(values), len(times))
+    if count <= 0:
+        return default
+    if elapsed <= times[0]:
+        return values[0]
+    if elapsed >= times[count - 1]:
+        return values[count - 1]
+    high = 1
+    while high < count and times[high] < elapsed:
+        high += 1
+    low = max(0, high - 1)
+    if high >= count:
+        return values[count - 1]
+    return values[low] if elapsed - times[low] <= times[high] - elapsed else values[high]
 
 
 def write_trajectory(csv_path, samples):
@@ -318,16 +1054,17 @@ def write_trajectory(csv_path, samples):
         csv_path: Destination CSV path.
         samples: Timed fused poses to write.
 
-    The output uses the prediction trajectory format plus the requested fusion
-    authority and the passivity-conditioned autonomy level:
-    ``time,x,y,z,qx,qy,qz,qw,alpha,autonomy_level``.
+    The output contains the requested fusion authority and, when enabled,
+    MuJoCo energy-tank diagnostics.
     """
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     has_alpha = any(sample.alpha is not None for sample in samples)
-    has_autonomy_level = any(sample.autonomy_level is not None for sample in samples)
-    fieldnames = POSE_FIELDS + (('alpha',) if has_alpha else ()) + (
-        ('autonomy_level',) if has_autonomy_level else ()
-    )
+    fieldnames = POSE_FIELDS + (('alpha',) if has_alpha else ())
+    passivity_fields = ('tank_energy', 'passivity_lambda', 'passivity_power',
+                        'autonomy_wrench_norm')
+    has_passivity = any(sample.tank_energy is not None for sample in samples)
+    if has_passivity:
+        fieldnames += passivity_fields
     with csv_path.open('w', newline='') as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
@@ -345,13 +1082,11 @@ def write_trajectory(csv_path, samples):
             }
             if has_alpha:
                 row['alpha'] = f'{sample.alpha:.6f}' if sample.alpha is not None else ''
-            if has_autonomy_level:
-                row['autonomy_level'] = (
-                    f'{sample.autonomy_level:.6f}'
-                    if sample.autonomy_level is not None else ''
-                )
+            if has_passivity:
+                for field in passivity_fields:
+                    value = getattr(sample, field)
+                    row[field] = f'{value:.6f}' if value is not None else ''
             writer.writerow(row)
-
 
 
 def find_trial_dirs(input_path, recursive):
@@ -482,6 +1217,20 @@ def fixed_metrics(config):
     )
 
 
+def controlled_output_path(fused_path):
+    """Build the simulated controller-output path from a fused-target path.
+
+    Args:
+        fused_path: Path to a ``fused_success_*.csv`` trajectory.
+
+    Returns:
+        Path to a ``controlled_success_*.csv`` trajectory.
+    """
+    return fused_path.with_name(
+        fused_path.name.replace('fused_success_', 'controlled_success_', 1)
+    )
+
+
 def fused_output_path(trial_dir, input_root, output_dir, prediction_path):
     """Build the destination path for one fused trajectory.
 
@@ -518,13 +1267,14 @@ class OfflineFusionTestNode(Node):
     """
 
     def __init__(self):
-        """Declare ROS parameters for offline fusion."""
+        """Initialize the node and declare all offline replay parameters."""
         super().__init__('offline_fusion_test')
         self.declare_parameter('input_path', '~/geo-gp/data/06-02/preds')
         self.declare_parameter('output_dir', '')
         self.declare_parameter('recursive', True)
         self.declare_parameter('overwrite', True)
         self.declare_parameter('leader_time_relative', False)
+        self.declare_parameter('leader_delay_sec', 0.0)
         self.declare_parameter('use_reference_metrics', True)
         self.declare_parameter('config_path', '/home/user/geo-gp/config/default.yaml')
         self.declare_parameter('model_dir', '/home/user/geo-gp/data/06-02/models/6d')
@@ -560,7 +1310,35 @@ class OfflineFusionTestNode(Node):
         self.declare_parameter('rate', 200.0)
         self.declare_parameter('leader_timeout_sec', 0.1)
         self.declare_parameter('fusion_policy', 'weighted_blending')
+        self.declare_parameter('tdpa_enabled', True)
+        self.declare_parameter('tdpa_delay_sec', 0.0)
+        # Optional physical replay. Values mirror cartesian_impedance_controller
+        self.declare_parameter('simulate_mujoco', False)
+        self.declare_parameter(
+            'mujoco_model_path',
+            '/home/user/humble_ws/src/bimanual_architecture/'
+            'franka_description/mujoco/franka/scene.xml',
+        )
+        self.declare_parameter('mujoco_site_name', 'panda_ee_site')
+        self.declare_parameter('mujoco_timestep', 0.001)
+        self.declare_parameter('mujoco_settle_time_sec', 0.0)
+        self.declare_parameter('mujoco_initialize_from_leader', True)
+        self.declare_parameter(
+            'mujoco_initial_joint_positions',
+            [0.0, -math.pi / 4.0, 0.0, -3.0 * math.pi / 4.0,
+             0.0, math.pi / 2.0, math.pi / 4.0],
+        )
+        self.declare_parameter('mujoco_pos_stiffness', 600.0)
+        self.declare_parameter('mujoco_rot_stiffness', 30.0)
+        self.declare_parameter('mujoco_nullspace_stiffness', 10.0)
+        self.declare_parameter('mujoco_torque_rate_limit', 1000.0)
+        self.declare_parameter('autonomy_tank_initial_energy', 2.0)
+        self.declare_parameter('autonomy_tank_max_energy', 5.0)
+        self.declare_parameter('autonomy_tank_recharge_efficiency', 0.8)
         self.declare_parameter('optimal_lambda_s', 0.10)
+        self.declare_parameter('autonomy_tank_power_epsilon', 1e-9)
+        self.declare_parameter('autonomy_tank_velocity_epsilon', 1e-6)
+        self.declare_parameter('autonomy_wrench_max_abs', 100.0)
         self.declare_parameter('optimal_lambda_c', 0.05)
         self.declare_parameter('nash_human_effort', 0.2)
         self.declare_parameter('nash_gp_effort', 0.5)
@@ -568,9 +1346,6 @@ class OfflineFusionTestNode(Node):
         self.declare_parameter('nash_gp_agreement', 0.10)
         self.declare_parameter('nash_agreement_ratio', 0.7)
         self.declare_parameter('nash_rotation_weight', 1.0)
-        # Same defaults as AutonomyPassivityParameters in the C++ controller
-        self.declare_parameter('autonomy_alpha_time_constant', 0.05)
-        self.declare_parameter('autonomy_alpha_rate_limit', 2.0)
         self._filtered_prediction_weight = 0.0
         self._previous_optimal_weight = 0.0
         self._last_fused_pose = None
@@ -612,6 +1387,8 @@ class OfflineFusionTestNode(Node):
             rate=self.get_float('rate'),
             leader_timeout_sec=self.get_float('leader_timeout_sec'),
             fusion_policy=self.normalize_fusion_policy(self.get_string('fusion_policy')),
+            tdpa_enabled=self.get_bool('tdpa_enabled'),
+            tdpa_delay_sec=max(0.0, self.get_float('tdpa_delay_sec')),
             optimal_lambda_s=self.get_float('optimal_lambda_s'),
             optimal_lambda_c=self.get_float('optimal_lambda_c'),
             nash_human_effort=self.get_float('nash_human_effort'),
@@ -620,8 +1397,26 @@ class OfflineFusionTestNode(Node):
             nash_gp_agreement=self.get_float('nash_gp_agreement'),
             nash_agreement_ratio=self.get_float('nash_agreement_ratio'),
             nash_rotation_weight=self.get_float('nash_rotation_weight'),
-            autonomy_alpha_time_constant=self.get_float('autonomy_alpha_time_constant'),
-            autonomy_alpha_rate_limit=self.get_float('autonomy_alpha_rate_limit'),
+            simulate_mujoco=self.get_bool('simulate_mujoco'),
+            mujoco_model_path=self.get_string('mujoco_model_path'),
+            mujoco_site_name=self.get_string('mujoco_site_name'),
+            mujoco_timestep=self.get_float('mujoco_timestep'),
+            mujoco_settle_time_sec=max(0.0, self.get_float('mujoco_settle_time_sec')),
+            mujoco_initialize_from_leader=self.get_bool(
+                'mujoco_initialize_from_leader'
+            ),
+            mujoco_pos_stiffness=self.get_float('mujoco_pos_stiffness'),
+            mujoco_rot_stiffness=self.get_float('mujoco_rot_stiffness'),
+            mujoco_nullspace_stiffness=self.get_float(
+                'mujoco_nullspace_stiffness'
+            ),
+            mujoco_torque_rate_limit=self.get_float('mujoco_torque_rate_limit'),
+            autonomy_tank_initial_energy=self.get_float('autonomy_tank_initial_energy'),
+            autonomy_tank_max_energy=self.get_float('autonomy_tank_max_energy'),
+            autonomy_tank_recharge_efficiency=self.get_float('autonomy_tank_recharge_efficiency'),
+            autonomy_tank_power_epsilon=self.get_float('autonomy_tank_power_epsilon'),
+            autonomy_tank_velocity_epsilon=self.get_float('autonomy_tank_velocity_epsilon'),
+            autonomy_wrench_max_abs=self.get_float('autonomy_wrench_max_abs'),
         )
 
     def normalize_fusion_policy(self, value):
@@ -884,6 +1679,7 @@ class OfflineFusionTestNode(Node):
         recursive = bool(self.get_parameter('recursive').value)
         overwrite = bool(self.get_parameter('overwrite').value)
         leader_time_relative = bool(self.get_parameter('leader_time_relative').value)
+        leader_delay_sec = max(0.0, self.get_float('leader_delay_sec'))
         config = self.config()
         predictor = self.make_predictor()
 
@@ -921,19 +1717,22 @@ class OfflineFusionTestNode(Node):
                 self.get_logger().info(f'Skipping existing output: {output_path}')
                 continue
 
-            count, min_alpha, max_alpha, min_autonomy, max_autonomy = self.fuse_trial(
+            count, min_alpha, max_alpha = self.fuse_trial(
                 prediction_path,
                 leader_path,
                 output_path,
                 config,
                 metrics,
                 leader_time_relative,
+                leader_delay_sec,
+                config.tdpa_delay_sec,
             )
             wrote += 1
             self.get_logger().info(
                 f'Wrote {count} fused samples | alpha_G=[{min_alpha:.3f}, {max_alpha:.3f}] | '
-                f'autonomy_level=[{min_autonomy:.3f}, {max_autonomy:.3f}] | '
-                f'metrics={metrics.source} | skill={metrics.skill_name} | {output_path}'
+                f'TDPA={config.tdpa_enabled}, delay={config.tdpa_delay_sec:.3f}s | '
+                f'leader_delay_legacy={leader_delay_sec:.3f}s | metrics={metrics.source} | '
+                f'skill={metrics.skill_name} | {output_path}'
             )
 
         self.get_logger().info(f'Offline fusion complete: {wrote} file(s) written')
@@ -1107,13 +1906,14 @@ class OfflineFusionTestNode(Node):
         config,
         metrics,
         leader_time_relative,
+        leader_delay_sec,
+        tdpa_delay_sec,
     ):
         """Replay one trial using the online fuser timer and policy logic.
 
-        The requested alpha is passed through the alpha-conditioning portion of
-        ``AutonomyPassivityController`` and saved as ``autonomy_level``. The
-        pose remains the unmodified online-fuser result: the C++ energy tank
-        acts downstream on wrenches, which are not present in a pose CSV.
+        When ``simulate_mujoco`` is enabled, physical end-effector state drives
+        the energy-tank update. The optional settle interval holds the final
+        fused target after the prediction ends.
 
         Args:
             prediction_path: Path to the saved prediction trajectory CSV.
@@ -1123,35 +1923,104 @@ class OfflineFusionTestNode(Node):
             metrics: Reconstructed prediction confidence metrics.
             leader_time_relative: Whether to align leader time to its first
                 sample before replay.
+            leader_delay_sec: Legacy direct delay applied when TDPA replay is
+                disabled.
+            tdpa_delay_sec: One-way delay for both TDPA communication directions.
 
         Returns:
-            Number of fused samples, alpha minimum/maximum, and autonomy-level
-            minimum/maximum, in that order.
+            Number of fused samples and alpha minimum/maximum, in that order.
         """
         prediction = read_trajectory(prediction_path)
         leader = read_trajectory(leader_path)
         prediction_poses = [sample.pose for sample in prediction]
         prediction_times = [sample.time for sample in prediction]
         leader_t0 = leader[0].time if leader_time_relative else 0.0
+        simulator = None
+        if config.simulate_mujoco:
+            initial_pose = leader[0].pose if config.mujoco_initialize_from_leader else None
+            simulator = MujocoAutonomyPassivitySimulator(
+                config.mujoco_model_path,
+                config.mujoco_site_name,
+                config.mujoco_timestep,
+                list(self.get_parameter('mujoco_initial_joint_positions').value),
+                config,
+                initial_pose=initial_pose,
+            )
+            self.get_logger().info(
+                f'Using MuJoCo EE state for autonomy energy tank: {config.mujoco_model_path}'
+            )
+            if simulator.initialization_error is not None:
+                position_error, orientation_error, converged = simulator.initialization_error
+                message = (
+                    'Initialized MuJoCo EE from the first leader pose | '
+                    f'position_error={position_error:.6f} m | '
+                    f'orientation_error={orientation_error:.6f} rad'
+                )
+                if converged:
+                    self.get_logger().info(message)
+                else:
+                    self.get_logger().warn(f'{message} | IK did not fully converge')
         leader = [TimedPose(max(0.0, sample.time - leader_t0), sample.pose) for sample in leader]
+        leader_times = [sample.time for sample in leader]
+        leader_velocities = []
+        for index, sample in enumerate(leader):
+            previous = leader[max(0, index - 1)]
+            following = leader[min(len(leader) - 1, index + 1)]
+            dt = max(following.time - previous.time, 1e-9)
+            linear = np.array((
+                (following.pose.position.x - previous.pose.position.x) / dt,
+                (following.pose.position.y - previous.pose.position.y) / dt,
+                (following.pose.position.z - previous.pose.position.z) / dt,
+            ))
+            angular = rotation_error(
+                pose_rotation(previous.pose),
+                pose_rotation(following.pose),
+            ) / dt
+            leader_velocities.append(np.r_[linear, angular])
+        tdpa = (
+            OfflineCartesianTDPA(leader[0].pose, tdpa_delay_sec)
+            if config.tdpa_enabled
+            else None
+        )
 
+        # OnlineFuserNode starts every accepted prediction with a fresh alpha
+        # filter. Trials must not leak authority state into one another.
+        self._filtered_prediction_weight = 0.0
         self._previous_optimal_weight = 0.0
         self._last_fused_pose = None
-        autonomy_controller = AutonomyPassivityController(
-            config.autonomy_alpha_time_constant,
-            config.autonomy_alpha_rate_limit,
-        )
         fused = []
+        controlled = []
         alphas = []
-        autonomy_levels = []
         previous_elapsed = 0.0
-        for elapsed in self.replay_times(max(0.0, prediction_times[-1]), config.rate):
+        replay_duration = max(0.0, prediction_times[-1]) + config.mujoco_settle_time_sec
+        for elapsed in self.replay_times(replay_duration, config.rate):
             predicted_pose = sample_timed_pose(prediction_poses, prediction_times, elapsed)
             if predicted_pose is None:
                 continue
-            leader_pose = self.latest_leader_pose(
-                leader, elapsed, max(0.0, config.leader_timeout_sec)
-            )
+            if tdpa is None:
+                leader_pose = self.latest_leader_pose(
+                    leader,
+                    elapsed - leader_delay_sec,
+                    max(0.0, config.leader_timeout_sec),
+                )
+            else:
+                leader_velocity = sample_timed_value(
+                    leader_velocities,
+                    leader_times,
+                    elapsed,
+                    np.zeros(6),
+                )
+                follower_wrench = (
+                    simulator.last_command_wrench
+                    if simulator is not None
+                    else np.zeros(6)
+                )
+                leader_pose = tdpa.step(
+                    elapsed,
+                    leader_velocity,
+                    follower_wrench,
+                    elapsed - previous_elapsed,
+                )
             point_variance = sample_timed_value(
                 metrics.point_variances, prediction_times, elapsed, metrics.trajectory_variance
             )
@@ -1161,19 +2030,51 @@ class OfflineFusionTestNode(Node):
                 point_variance=point_variance,
                 chunk_error=metrics.chunk_error,
                 progress=metrics.progress,
+                network_delay=max(
+                    config.network_delay,
+                    tdpa_delay_sec if tdpa is not None else leader_delay_sec,
+                ),
             )
             fused_pose, alpha = self.fuse_pose_online(
                 predicted_pose, leader_pose, sample_config
             )
-            autonomy_level = autonomy_controller.update_alpha(alpha, elapsed - previous_elapsed)
             self._last_fused_pose = fused_pose
-            fused.append(TimedPose(elapsed, fused_pose, alpha, autonomy_level))
+            tank_energy = passivity_lambda = passivity_power = wrench_norm = None
+            controlled_pose = fused_pose
+            if simulator is not None:
+                physical_leader_pose = leader_pose if leader_pose is not None else fused_pose
+                (controlled_pose, tank_energy, passivity_lambda, passivity_power,
+                 wrench_norm) = simulator.advance(
+                    physical_leader_pose,
+                    fused_pose,
+                    elapsed - previous_elapsed,
+                )
+            fused.append(TimedPose(
+                elapsed,
+                fused_pose,
+                alpha,
+                tank_energy=tank_energy,
+                passivity_lambda=passivity_lambda,
+                passivity_power=passivity_power,
+                autonomy_wrench_norm=wrench_norm,
+            ))
+            if simulator is not None:
+                controlled.append(TimedPose(
+                    elapsed,
+                    controlled_pose,
+                    alpha,
+                    tank_energy=tank_energy,
+                    passivity_lambda=passivity_lambda,
+                    passivity_power=passivity_power,
+                    autonomy_wrench_norm=wrench_norm,
+                ))
             alphas.append(alpha)
-            autonomy_levels.append(autonomy_level)
             previous_elapsed = elapsed
 
         write_trajectory(output_path, fused)
-        return len(fused), min(alphas), max(alphas), min(autonomy_levels), max(autonomy_levels)
+        if controlled:
+            write_trajectory(controlled_output_path(output_path), controlled)
+        return len(fused), min(alphas), max(alphas)
 
 
 def main(args=None):
