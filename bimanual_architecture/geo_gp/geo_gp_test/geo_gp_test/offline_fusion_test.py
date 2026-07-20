@@ -1231,7 +1231,8 @@ def controlled_output_path(fused_path):
     )
 
 
-def fused_output_path(trial_dir, input_root, output_dir, prediction_path):
+def fused_output_path(
+        trial_dir, input_root, output_dir, prediction_path, fusion_policy):
     """Build the destination path for one fused trajectory.
 
     Args:
@@ -1242,11 +1243,14 @@ def fused_output_path(trial_dir, input_root, output_dir, prediction_path):
             the input CSV files.
         prediction_path: Prediction CSV whose timestamp is reused for the fused
             CSV filename.
+        fusion_policy: Normalized policy name appended to the output filename.
 
     Returns:
-        Destination path named ``fused_success_*.csv``.
+        Destination path named ``fused_success_<timestamp>_<policy>.csv``.
     """
     suffix = prediction_path.name.replace('prediction_success_', 'fused_success_', 1)
+    suffix_path = Path(suffix)
+    suffix = f'{suffix_path.stem}_{fusion_policy}{suffix_path.suffix}'
     if output_dir is None:
         return trial_dir / suffix
 
@@ -1712,6 +1716,7 @@ class OfflineFusionTestNode(Node):
                 input_path if input_path.is_dir() else input_path.parent,
                 output_dir,
                 prediction_path,
+                config.fusion_policy,
             )
             if output_path.exists() and not overwrite:
                 self.get_logger().info(f'Skipping existing output: {output_path}')
