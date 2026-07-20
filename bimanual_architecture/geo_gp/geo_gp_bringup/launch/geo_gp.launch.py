@@ -82,7 +82,7 @@ def generate_launch_description():
                 "fusion_policy": "weighted_blending",
                 "min_prediction_weight": 0.0,
                 "max_prediction_weight": 1.0,
-                "network_k_delay": 3.0,
+                "network_k_delay": 4.5,
                 "network_delay_max": 0.2,
                 "network_k_jitter": 3.0,
                 "network_jitter_max": 0.05,

@@ -136,7 +136,7 @@ def compute_network_confidence(
     delay,
     jitter,
     *,
-    network_k_delay=3.0,
+    network_k_delay=4.5,
     network_delay_max=0.2,
     network_k_jitter=3.0,
     network_jitter_max=0.05,

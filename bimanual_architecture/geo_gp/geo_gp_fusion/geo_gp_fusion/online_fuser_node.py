@@ -43,7 +43,7 @@ class OnlineFuserNode(Node):
         self.declare_parameter('fusion_policy', 'weighted_blending')
         self.declare_parameter('min_prediction_weight', 0.0)
         self.declare_parameter('max_prediction_weight', 1.0)
-        self.declare_parameter('network_k_delay', 3.0)
+        self.declare_parameter('network_k_delay', 4.5)
         self.declare_parameter('network_delay_max', 0.2)
         self.declare_parameter('network_k_jitter', 3.0)
         self.declare_parameter('network_jitter_max', 0.05)
