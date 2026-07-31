@@ -11,6 +11,10 @@ from geo_gp_fusion.policies.optimal_blending import optimal_blend_pose, pose_con
 from geo_gp_fusion.policies.weighted_blending import blend_pose, sample_timed_pose
 from geo_gp_interfaces.msg import PromptTrajectory
 from geo_gp_prediction.predictor import Predictor
+from geo_gp_test.reference_predictor import (
+    ensure_current_skill_trained,
+    make_current_reference_predictor,
+)
 from geometry.frame6d import estimate_rotation_scale_3d_search_by_count
 from geometry.resample import resample_by_arclen_fraction
 from geometry_msgs.msg import Pose, Vector3
@@ -1281,6 +1285,8 @@ class OfflineFusionTestNode(Node):
         self.declare_parameter('leader_delay_sec', 0.0)
         self.declare_parameter('use_reference_metrics', True)
         self.declare_parameter('config_path', '/home/user/geo-gp/config/default.yaml')
+        self.declare_parameter('retrain_reference_models', True)
+        self.declare_parameter('reference_dir', '')
         self.declare_parameter('model_dir', '/home/user/geo-gp/data/06-02/models/6d')
         self.declare_parameter('predict_force', True)
         self.declare_parameter('confidence_gain', 1.0)
@@ -1479,7 +1485,7 @@ class OfflineFusionTestNode(Node):
         """
         return str(self.get_parameter(name).value).strip()
 
-    def make_predictor(self):
+    def make_predictor(self, input_path):
         """Create a predictor for reconstructing reference-model metrics.
 
         Returns:
@@ -1489,11 +1495,25 @@ class OfflineFusionTestNode(Node):
         if not self.get_bool('use_reference_metrics'):
             return None
         config_path = self.get_string('config_path')
-        model_dir = self.get_string('model_dir')
-        if not config_path or not model_dir:
+        if not config_path:
             self.get_logger().warn(
-                'Reference metrics requested but config_path/model_dir is empty; '
+                'Reference metrics requested but config_path is empty; '
                 'using fixed metrics'
+            )
+            return None
+        if self.get_bool('retrain_reference_models'):
+            return make_current_reference_predictor(
+                self,
+                input_path,
+                config_path,
+                self.get_string('reference_dir'),
+            )
+
+        model_dir = self.get_string('model_dir')
+        if not model_dir:
+            self.get_logger().warn(
+                'Reference metrics requested with retraining disabled but '
+                'model_dir is empty; using fixed metrics'
             )
             return None
         return Predictor(self.get_logger(), config_path, model_dir)
@@ -1635,9 +1655,10 @@ class OfflineFusionTestNode(Node):
             saved_skill = skill_by_name.get(saved_skill_name)
             if saved_skill is None:
                 self.get_logger().warn(
-                    f'Saved reference skill {saved_skill_name} is not in model_dir; '
-                    'using matched predictor context'
+                    f'Saved reference skill {saved_skill_name} is unavailable; '
+                    'using fixed metrics'
                 )
+                return fixed_metrics(config)
             else:
                 ctx['skill'] = saved_skill
                 ctx['ref_eq'] = saved_skill.ref_eq
@@ -1657,6 +1678,8 @@ class OfflineFusionTestNode(Node):
                 )
                 ctx['skill_rmse'] = saved_rmse
 
+        if self.get_bool('retrain_reference_models'):
+            ensure_current_skill_trained(self, ctx['skill'])
         predicted = predictor.predict_from_context(ctx)
         if not predicted.success:
             self.get_logger().warn(
@@ -1685,7 +1708,7 @@ class OfflineFusionTestNode(Node):
         leader_time_relative = bool(self.get_parameter('leader_time_relative').value)
         leader_delay_sec = max(0.0, self.get_float('leader_delay_sec'))
         config = self.config()
-        predictor = self.make_predictor()
+        predictor = self.make_predictor(input_path)
 
         if not input_path.exists():
             raise FileNotFoundError(f'input_path does not exist: {input_path}')
