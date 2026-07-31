@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'offline_fusion_test = geo_gp_test.offline_fusion_test:main',
+            'retrain_predictions = geo_gp_test.retrain_predictions:main',
         ],
     },
 )
